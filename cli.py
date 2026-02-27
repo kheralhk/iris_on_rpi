@@ -22,18 +22,20 @@ def iris_gen(filename, o, v):
     filename = filename.rsplit('.', 1)[0]
     iris_code = np.array(iris_code, dtype=np.bool)
     mask_code = np.array(mask_code, dtype=np.bool)
-    code = np.stack((iris_code, mask_code), axis=0)
+    
+    # Store iris code in (2, 1, 2048) shape
+    code = np.stack((iris_code, mask_code), axis=0)[:, np.newaxis, :]
     if v:
         click.echo("".join([str(i) for i in iris_code.astype(int)]))
         click.echo("".join([str(i) for i in mask_code.astype(int)]))
     if o is not None:
         np.save(o, code)
         if not v:
-            click.echo("Saved iris code to " + o + ".npy")
+            click.echo("Saved iris code to " + o)
     else:
-        np.save("code_"+filename, code)
+        np.save(filename, code)
         if not v:
-            click.echo("Saved iris code to " + "code_" + filename + ".npy")
+            click.echo("Saved iris code to " + filename + ".npy")
 
 @cli.command()
 @click.argument('filenames', nargs=-1, type=click.Path(exists=True))
@@ -53,8 +55,8 @@ def iris_gens(filenames):
     iris_codes = np.array(iris_codes, dtype=np.bool)
     mask_codes = np.array(mask_codes, dtype=np.bool)
     codes = np.stack((iris_codes, mask_codes), axis=0)
-    np.save("codes.npy", codes)
-    click.echo("saved to codes.npy")
+    np.save("iriscodes.npy", codes)
+    click.echo("saved to iriscodes.npy")
 
 @cli.command()
 @click.argument("filename1", type=click.Path(exists=True))
@@ -76,8 +78,14 @@ def compare_iris_code(filename, code_path, rotation=21):
     img = cv.imread(filename)
     iris, mask = get_iris_band(img)
     code = np.load(code_path)
-    iris_code = code[0]
-    mask_code = code[1]
+    if code.ndim == 3 and code.shape[0] == 2:
+        # (2, N, L) or (2, 1, L) => pick the first sample
+        iris_code = code[0, 0]
+        mask_code = code[1, 0]
+    else:
+        # (2, L)
+        iris_code = code[0]
+        mask_code = code[1]
     score, _ = iris_classifier.compare_iris_code_and_iris(iris, iris_code, mask, mask_code)
     click.echo(score)
     
@@ -117,21 +125,34 @@ def find(filename, codes_path, rotation, threshold):
             
 @cli.command()
 @click.argument("filename", type=click.Path(exists=True))
-@click.argument("codes_path", type=click.Path(exists=True))
+@click.argument("codes_path", type=click.Path(exists=False))
 def enroll(filename, codes_path):
-    codes = np.load(codes_path)
-    
+    # Read image and compute iris code
     img = cv.imread(filename)
     iris, mask = get_iris_band(img)
     iris_code, mask_code, _ = iris_classifier.get_iris_code(iris, mask)
-    
-    iris_code = np.array(iris_code, dtype=np.bool)
-    mask_code = np.array(mask_code, dtype=np.bool)
+
+    # Ensure boolean arrays and build (2, L)
+    iris_code = np.array(iris_code, dtype=bool)
+    mask_code = np.array(mask_code, dtype=bool)
     code = np.stack((iris_code, mask_code), axis=0)
-    codes = np.concat((codes, code[:, np.newaxis, :]), axis=1)
+
+    try:
+        # Try to load an existing database (expected shape (2, N, L))
+        codes = np.load(codes_path)
+        # Append new sample as (2, 1, L)
+        codes = np.concatenate((codes, code[:, np.newaxis, :]), axis=1)
+        idx = codes.shape[1] - 1
+        
+    except FileNotFoundError:
+        # Create a new database with the first sample as (2, 1, L)
+        codes = code[:, np.newaxis, :]
+        idx = 0
+
     np.save(codes_path, codes)
     click.echo("Enrolled iris into " + codes_path)
-    click.echo("idx: " + str(codes.shape[1]-1))
+    click.echo("idx: " + str(idx))
+
 
 if __name__ == '__main__':
     cli()

@@ -6,6 +6,10 @@ import tempfile
 from pathlib import Path
 tmp = Path(tempfile.gettempdir())
 
+wahet_counter = 0
+
+
+
 @nb.njit
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
@@ -175,6 +179,9 @@ def get_iris_code(iris, _filters, settings, mask=None, offset=0):
 
 def get_iris_band(img):
     cv.imwrite(tmp/"input.png", img)
+    global wahet_counter
+    wahet_counter += 1
+    print("Calling wahet for the: ", wahet_counter, "th time.")
     subprocess.run(["./wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True)
     image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
     mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)

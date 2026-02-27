@@ -49,7 +49,7 @@ python cli.py iris_gen images/eye1.jpg -o iris_code1.npy
 python main.py iris_gens <filename1> <filename2> ...
 ```
 
-- Generates iris codes for multiple images and saves them to `codes.npy`.
+- Generates iris codes for multiple images and saves them to `iriscodes.npy`.
 
 Example:
 
@@ -109,11 +109,11 @@ python cli.py iris_gens dataset/*.jpg
 2. Compare a new image to the database:
 
 ```bash
-python cli.py find new_image.jpg codes.npy
+python cli.py find new_image.jpg iriscodes.npy
 ```
 
 3. Enroll a new iris:
 
 ```bash
-python cli.py enroll new_image.jpg codes.npy
+python cli.py enroll new_image.jpg iriscodes.npy
 ```
