@@ -175,7 +175,7 @@ def get_iris_code(iris, _filters, settings, mask=None, offset=0):
 
 def get_iris_band(img):
     cv.imwrite(tmp/"input.png", img)
-    subprocess.run(["wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True)
+    subprocess.run(["./wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True)
     image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
     mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)
     return image, mask
