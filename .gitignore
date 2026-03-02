@@ -1,6 +1,7 @@
 # Project specific ignores
 dataset/
 extra_files/
+captures/
 wahet
 
 # Byte-compiled / optimized / DLL files
