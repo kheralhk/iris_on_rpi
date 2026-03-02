@@ -1,13 +1,14 @@
+# iris.py
+
 import cv2 as cv
 import numpy as np
 import numba as nb
 import subprocess
 import tempfile
+import time
+from profiling import timeit, span
 from pathlib import Path
 tmp = Path(tempfile.gettempdir())
-
-wahet_counter = 0
-
 
 
 @nb.njit
@@ -20,6 +21,7 @@ def hamming_distance(a,b,mask1, mask2):
         return 2.0
     return total/n
 
+@timeit
 def get_patches(img):
     height = img.shape[0]
     patches = []
@@ -33,6 +35,7 @@ def get_patches(img):
             patches.append(img[x0:x1, y0:y1])
     return patches
 
+@timeit
 def get_filters(sigma=2, gamma=1):
     kernels = []
     angles = [np.pi/4, -np.pi/4, 0, np.pi/2]
@@ -43,6 +46,7 @@ def get_filters(sigma=2, gamma=1):
             kernels.append(kernel)
     return kernels
 
+@timeit
 def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
     """Create a complex Gabor kernel."""
     y_size, x_size = size
@@ -134,6 +138,7 @@ def apply_filter_to_iris(iris, filter, stride, start_position, mask=None):
             mask_bits[i*h//y_stride+j] = mask_bit
     return results, mask_bits
 
+@timeit
 def get_iris_code(img):
     patches = get_patches(img)
     iris_code = ""
@@ -152,6 +157,7 @@ def get_iris_code(img):
             iris_code = iris_code + s0 + s1
     return iris_code
 
+@timeit
 def scale_iris_band_vertical(img, mask, offset):
     if offset > 0:
         iris_img = cv.resize(img[:-offset,:], (512,64), interpolation=cv.INTER_LANCZOS4)
@@ -163,13 +169,21 @@ def scale_iris_band_vertical(img, mask, offset):
         return img, mask
     return iris_img, iris_mask
 
+@timeit
 def get_iris_code(iris, _filters, settings, mask=None, offset=0):
     bits = np.array([], dtype=np.bool)
     filters = np.array([], dtype=np.uint8)
     mask_bits = np.array([], dtype=np.bool)
     for i, filter in enumerate(_filters):
-        x, y = settings[i]["start_position"]
-        result, mask_bit_list = apply_filter_to_iris(iris, filter, settings[i]["stride"], (x+offset,y), mask)
+        start_x, start_y = settings[i]["start_position"]
+        start_pos = (start_x + offset, start_y)
+        result, mask_bit_list = apply_filter_to_iris(
+            iris,
+            filter,
+            settings[i]["stride"],
+            start_pos,
+            mask,
+        )
         new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
         filter = np.ones_like(new_bits)*i
         bits = np.concat([bits,new_bits])
@@ -177,12 +191,12 @@ def get_iris_code(iris, _filters, settings, mask=None, offset=0):
         mask_bits = np.concat([mask_bits, mask_bit])
     return bits, mask_bits, filters
 
+@timeit
 def get_iris_band(img):
     cv.imwrite(tmp/"input.png", img)
-    global wahet_counter
-    wahet_counter += 1
-    print("Calling wahet for the: ", wahet_counter, "th time.")
-    subprocess.run(["./wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True)
+    with span("wahet"):
+        subprocess.run(["./wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True
+        )
     image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
     mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)
     return image, mask
@@ -191,6 +205,7 @@ class IrisClassifier():
     def __init__(self, filters) -> None:
         self.init_filters(filters)
         
+    @timeit
     def init_filters(self, filters):
         self._filters = [] 
         for filter_settings in filters:
@@ -203,17 +218,26 @@ class IrisClassifier():
             self._filters.append(filter)
         self._filter_settings = filters
 
+    @timeit
     def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0):
         bits_1, mask_1, _ = self.get_iris_code(iris1, mask1)
         return self.compare_iris_code_and_iris(iris2, bits_1, mask2, mask_1, rotation=rotation, offset=offset)
-
+    
+    @timeit
     def get_iris_code(self, iris, mask=None, offset=0):
         bits = np.array([], dtype=np.bool)
         filters = np.array([], dtype=np.uint8)
         mask_bits = np.array([], dtype=np.bool)
         for i, filter in enumerate(self._filters):
-            x, y = self._filter_settings[i]["start_position"]
-            result, mask_bit_list = apply_filter_to_iris(iris, filter, self._filter_settings[i]["stride"], (x+offset,y), mask)
+            start_x, start_y = self._filter_settings[i]["start_position"]
+            start_pos = (start_x + offset, start_y)
+            result, mask_bit_list = apply_filter_to_iris(
+                iris,
+                filter,
+                self._filter_settings[i]["stride"],
+                start_pos,
+                mask,
+            )
             new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
             filter = np.ones_like(new_bits)*i
             bits = np.concat([bits,new_bits])
@@ -221,6 +245,7 @@ class IrisClassifier():
             mask_bits = np.concat([mask_bits, mask_bit])
         return bits, mask_bits, filters
     
+    @timeit
     def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
@@ -230,3 +255,4 @@ class IrisClassifier():
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=i-rotation//2)
             scores[i] = hamming_distance(bits, iris_code, mask, iris_code_mask)
         return (np.min(scores), np.argmin(scores)-rotation//2)
+

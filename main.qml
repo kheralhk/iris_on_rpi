@@ -34,16 +34,14 @@ ApplicationWindow {
         imageCapture: imageCapture
         videoOutput: viewfinder
     }
-    //
+    
+    
     Timer {
         id: timer
         interval: 5000
         repeat: true
         running: false
     }
-    
-    
-    
 
     Item {
         anchors.fill: parent
@@ -57,22 +55,29 @@ ApplicationWindow {
             fillMode: VideoOutput.PreserveAspectFit
         }
         
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 12
+        // Actions panel to the right of the camera preview
+        Column {
+            id: actionsPanel
+            anchors.left: viewfinder.right
+            anchors.leftMargin: 32
+            anchors.verticalCenter: viewfinder.verticalCenter
+            spacing: 64
 
             // Identify button (toggle loop)
             Button {
                 id: buttonIdentify
-                anchors.verticalCenter: parent.verticalCenter
-                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                 text: timer.running ? "Stop Identify" : "Start Identify"
-                onClicked: {
-                    timer.running = !timer.running
-                }
+                onClicked: { timer.running = !timer.running }
             }
-            
 
+            // Enroll button
+            Button {
+                id: buttonEnroll
+                text: "Enroll"
+                onClicked: { console.log("Enroll tapped") }
+            }
+        }
+        
         // Controls overlay
         Item {
             id: controls
@@ -82,14 +87,12 @@ ApplicationWindow {
             anchors.margins: 16
             height: 100
             
-            
             // Item { Layout.fillWidth: true }
             Button {
                 id: buttonShutter
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.bottom: parent.bottom
                 anchors.bottomMargin: 8
-                Layout.alignment: Qt.AlignHCenter | Qt.AlignVCenter
                 width: 50
                 height: 50
                 text: ""
@@ -103,19 +106,10 @@ ApplicationWindow {
                 }
                 onClicked: {
                     imageCapture.captureToFile("/Users/krist/Documents/project/iris_on_rpi/captures")
-                    background: Rectangle {
-                        radius: width / 2
-                        color: "transparent"
-                        border.width: 20
-                        border.color: "grey"
-                    }
                 }
             }
     
-                // Item { Layout.fillWidth: true }
-
-
-            }
+            // Item { Layout.fillWidth: true }
         }
     }
 }

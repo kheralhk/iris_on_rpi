@@ -1,3 +1,5 @@
+# filters.py
+
 import numpy as np
 
 filters = [

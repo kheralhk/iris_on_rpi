@@ -1,3 +1,5 @@
+# cli.py
+
 import click
 import cv2 as cv
 from iris import get_iris_band, IrisClassifier, hamming_distance
