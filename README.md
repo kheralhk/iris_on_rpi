@@ -73,6 +73,8 @@ python cli.py compare_iris_code <filename> <code_path> [--rotation <rotation>]
 ```
 
 - Compares an iris image to a stored iris code.
+- Default 'code_path': iris_codes.npy
+
 
 ### Find Best Match in Iris Database
 
@@ -83,6 +85,7 @@ python cli.py find <filename> <codes_path> [--rotation <rotation>] [--threshold 
 - Searches a database of iris codes and returns the best match index and score.
 - Default rotation: 21
 - Default threshold: 0.3
+- Default 'codes_path': iris_codes.npy
 
 ### Enroll a New Iris Code
 
@@ -91,6 +94,7 @@ python cli.py enroll <filename> <codes_path>
 ```
 
 - Adds a new iris code to the existing database.
+- Default 'codes_path': iris_codes.npy
 
 ## Notes
 

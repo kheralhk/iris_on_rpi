@@ -57,8 +57,8 @@ def iris_gens(filenames):
     iris_codes = np.array(iris_codes, dtype=np.bool)
     mask_codes = np.array(mask_codes, dtype=np.bool)
     codes = np.stack((iris_codes, mask_codes), axis=0)
-    np.save("iriscodes.npy", codes)
-    click.echo("saved to iriscodes.npy")
+    np.save("iris_codes.npy", codes)
+    click.echo("saved to iris_codes.npy")
 
 @cli.command()
 @click.argument("filename1", type=click.Path(exists=True))
@@ -74,7 +74,7 @@ def compare(filename1, filename2, rotation):
 
 @cli.command()
 @click.argument("filename", type=click.Path(exists=True))
-@click.argument("code_path", type=click.Path(exists=True))
+@click.argument("code_path", type=click.Path(exists=True), required=False, default="iris_codes.npy")
 @click.option("--rotation", type=click.INT, default=21, show_default=True)
 def compare_iris_code(filename, code_path, rotation=21):
     img = cv.imread(filename)
@@ -93,7 +93,7 @@ def compare_iris_code(filename, code_path, rotation=21):
     
 @cli.command()
 @click.argument("filename", type=click.Path(exists=True))
-@click.argument("codes_path", type=click.Path(exists=True))
+@click.argument("codes_path", type=click.Path(exists=True), required=False, default="iris_codes.npy")
 @click.option("--rotation", type=click.INT, default=21, show_default=True)
 @click.option("--threshold", default=0.3, show_default=True, help="stops searching when lower then threshold")
 
@@ -113,21 +113,28 @@ def find(filename, codes_path, rotation, threshold):
     
     best_match = None
     score = 1.0
+    found = False
     
     for j in range(codes.shape[1]):
         for i in range(rotation):
-            curr_score = hamming_distance(iris_codes[i], codes[0,j], mask_codes[i], codes[1,j])
+            curr_score = hamming_distance(iris_codes[i], codes[0, j], mask_codes[i], codes[1, j])
             if curr_score < score:
                 score = curr_score
                 best_match = j
-        if score < threshold:
+            if curr_score < threshold:
+                # Early exit as soon as a good-enough score is found.
+                score = curr_score
+                best_match = j
+                found = True
+                break
+        if found:
             break
     click.echo("idx: " + str(best_match))
     click.echo("Score: " + str(score))
             
 @cli.command()
 @click.argument("filename", type=click.Path(exists=True))
-@click.argument("codes_path", type=click.Path(exists=False))
+@click.argument("codes_path", type=click.Path(exists=False), required=False, default="iris_codes.npy")
 def enroll(filename, codes_path):
     # Read image and compute iris code
     img = cv.imread(filename)
