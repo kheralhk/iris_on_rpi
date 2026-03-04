@@ -138,59 +138,6 @@ def apply_filter_to_iris(iris, filter, stride, start_position, mask=None):
             mask_bits[i*h//y_stride+j] = mask_bit
     return results, mask_bits
 
-@timeit
-def get_iris_code(img):
-    print("[DEBUG] Standalone get_iris_code(img) was called")
-    patches = get_patches(img)
-    iris_code = ""
-    filters = get_filters(2, 0.5)
-    for patch in patches:
-        for j in range(len(filters)):
-            filterr = np.real(filters[j])
-            filterr = filterr - np.mean(filterr)
-            filteri = np.imag(filters[j])
-            
-            resultr = np.sum(patch[:15, :15]*filterr)
-            resulti = np.sum(patch[:15, :15]*filteri)
-            
-            s0 = "1" if resultr >= 0 else "0"
-            s1 = "1" if resulti >= 0 else "0"
-            iris_code = iris_code + s0 + s1
-    return iris_code
-
-@timeit
-def scale_iris_band_vertical(img, mask, offset):
-    if offset > 0:
-        iris_img = cv.resize(img[:-offset,:], (512,64), interpolation=cv.INTER_LANCZOS4)
-        iris_mask = cv.resize(mask[:-offset,:], (512,64), interpolation=cv.INTER_NEAREST)
-    elif offset < 0:
-        iris_img = cv.resize(img[-offset:,:], (512, 64), interpolation=cv.INTER_LANCZOS4)
-        iris_mask = cv.resize(mask[-offset:,:], (512,64), interpolation=cv.INTER_NEAREST)
-    else:
-        return img, mask
-    return iris_img, iris_mask
-
-@timeit
-def get_iris_code(iris, _filters, settings, mask=None, offset=0):
-    bits = np.array([], dtype=np.bool)
-    filters = np.array([], dtype=np.uint8)
-    mask_bits = np.array([], dtype=np.bool)
-    for i, filter in enumerate(_filters):
-        start_x, start_y = settings[i]["start_position"]
-        start_pos = (start_x + offset, start_y)
-        result, mask_bit_list = apply_filter_to_iris(
-            iris,
-            filter,
-            settings[i]["stride"],
-            start_pos,
-            mask,
-        )
-        new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
-        filter = np.ones_like(new_bits)*i
-        bits = np.concat([bits,new_bits])
-        filters = np.concat([filters, filter])
-        mask_bits = np.concat([mask_bits, mask_bit])
-    return bits, mask_bits, filters
 
 @timeit
 def get_iris_band(img):
@@ -242,33 +189,15 @@ class IrisClassifier():
                 start_pos,
                 mask,
             )
-            
             t1 = time.perf_counter()
             print(f"[IrisClassifier.get_iris_code] filter {i}: apply_filter_to_iris took {(t1 - t0):.3f} seconds")
             
-            t2 = time.perf_counter()
             new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
-            
-            t3 = time.perf_counter()
-            print(f"[IrisClassifier.get_iris_code] filter {i}: complex_to_bits took {(t3 - t2):.3f} seonds")
-            
-            t4 = time.perf_counter()
-            
             filter = np.ones_like(new_bits)*i
-            
             bits = np.concat([bits,new_bits])
-            
             filters = np.concat([filters, filter])
-            
             mask_bits = np.concat([mask_bits, mask_bit])
-            
-            t5 = time.perf_counter()
-            print(f"[IrisClassifier.get_iris_code] filter {i}: concatenation took {(t5 - t4):.3f} seconds")
-        loop_t1 = time.perf_counter()
-        print(f"[IrisClassifier.get_iris_code] loop over filters took {(loop_t1 - loop_t0):.3f} seconds")
-        func_t1 = time.perf_counter()
-        print(f"[IrisClassifier.get_iris_code] total took {(func_t1 - func_t0):.3f} seconds")
-        
+                    
         return bits, mask_bits, filters
     
     @timeit

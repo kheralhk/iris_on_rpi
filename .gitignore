@@ -2,6 +2,7 @@
 dataset/
 extra_files/
 captures/
+iris_codes.npy/
 wahet
 
 # Byte-compiled / optimized / DLL files
