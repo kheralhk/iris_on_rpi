@@ -136,12 +136,12 @@ def find(filename, codes_path, rotation, threshold):
 @click.argument("filename", type=click.Path(exists=True))
 @click.argument("codes_path", type=click.Path(exists=False), required=False, default="iris_codes.npy")
 def enroll(filename, codes_path):
-    # Read image and compute iris code
+
     img = cv.imread(filename)
     iris, mask = get_iris_band(img)
     iris_code, mask_code, _ = iris_classifier.get_iris_code(iris, mask)
 
-    # Ensure boolean arrays and build (2, L)
+    # Ensure boolean arrays and shape (2, L)
     iris_code = np.array(iris_code, dtype=bool)
     mask_code = np.array(mask_code, dtype=bool)
     code = np.stack((iris_code, mask_code), axis=0)
