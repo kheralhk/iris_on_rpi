@@ -112,25 +112,22 @@ def find(filename, codes_path, rotation, threshold):
         iris_codes[i], mask_codes[i], _ = iris_classifier.get_iris_code(iris, mask, offset=i-rotation//2)
     
     best_match = None
-    score = 1.0
-    found = False
-    
+    best_score = float('inf')
+
+    # Evaluate all database entries across all rotations and keep the global best
     for j in range(codes.shape[1]):
         for i in range(rotation):
             curr_score = hamming_distance(iris_codes[i], codes[0, j], mask_codes[i], codes[1, j])
-            if curr_score < score:
-                score = curr_score
+            if curr_score < best_score:
+                best_score = curr_score
                 best_match = j
-            if curr_score < threshold:
-                # Early exit as soon as a good-enough score is found.
-                score = curr_score
-                best_match = j
-                found = True
-                break
-        if found:
-            break
+
     click.echo("idx: " + str(best_match))
-    click.echo("Score: " + str(score))
+    click.echo("Score: " + str(best_score))
+    if best_score < threshold:
+        click.echo("Result: below threshold")
+    else:
+        click.echo("Result: above threshold")
             
 @cli.command()
 @click.argument("filename", type=click.Path(exists=True))
@@ -165,3 +162,4 @@ def enroll(filename, codes_path):
 
 if __name__ == '__main__':
     cli()
+
