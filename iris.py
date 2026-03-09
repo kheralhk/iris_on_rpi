@@ -72,7 +72,6 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
 @nb.njit
 def apply_filter(iris, filter, x, y, mask=None):
     """Filters should have 0 DC"""
-    # w, h = filter.shape
     h, w = filter.shape
     patch = get_patch(iris, x, y, w, h)
     filter_real = np.real(filter)

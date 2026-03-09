@@ -14,14 +14,14 @@ cd <repo_directory>
 2. Create a virtual environment and install dependencies:
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venvScriptsactivate
+python -m venv .venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Compile wahet from [here](https://github.com/ngoclamvt123/usit-v2.2.0)
+3. Compile wahet from [here](https://github.com/ngoclamvt123/usit-v2.2.0).
 
-4. Put the wahet executable into your path variable or in the current directory
+4. Put the wahet executable into your path variable or in the current directory.
 
 ## Usage
 
@@ -73,28 +73,28 @@ python cli.py compare_iris_code <filename> <code_path> [--rotation <rotation>]
 ```
 
 - Compares an iris image to a stored iris code.
-- Default 'code_path': iris_codes.npy
+- Default `code_path`: iriscodes.npy
 
 
 ### Find Best Match in Iris Database
 
 ```bash
-python cli.py find <filename> <codes_path> [--rotation <rotation>] [--threshold <threshold>]
+python cli.py find <filename> <iriscodes> [--rotation <rotation>] [--threshold <threshold>]
 ```
 
 - Searches a database of iris codes and returns the best match index and score.
-- Default rotation: 21
-- Default threshold: 0.3
-- Default 'codes_path': iris_codes.npy
+- Default `rotation`: 21
+- Default `threshold`: 0.3
+- Default `iriscodes`: iriscodes.npy
 
 ### Enroll a New Iris Code
 
 ```bash
-python cli.py enroll <filename> <codes_path>
+python cli.py enroll <filename> <iriscodes>
 ```
 
 - Adds a new iris code to the existing database.
-- Default 'codes_path': iris_codes.npy
+- Default `iriscodes`: iriscodes.npy
 
 ## Notes
 
