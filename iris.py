@@ -11,7 +11,6 @@ from pathlib import Path
 tmp = Path(tempfile.gettempdir())
 
 
-@nb.njit
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
     mask = np.bitwise_and(mask1, mask2)
@@ -84,7 +83,7 @@ def apply_filter(iris, filter, x, y, mask=None):
         return result_real+result_imag*1j, mask_bit
     return result_real+result_imag*1j, True
    
-@nb.njit
+
 def complex_to_bits(z, mask_bit_list):
     real = (z.real >= 0).astype(np.bool)
     imag = (z.imag >= 0).astype(np.bool)
