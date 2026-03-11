@@ -71,15 +71,31 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
 @nb.njit
 def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
     """Filters should have 0 DC"""
-    h, w = filter_real.shape
-    patch = get_patch(iris, x, y, w, h)
-    result_real = np.sum(filter_real * patch)
-    result_imag = np.sum(filter_imag * patch)
-    if mask is not None:
-        patch = get_patch(mask, x, y, w, h)
-        mask_bit = np.all(patch == 255)
-        return result_real+result_imag*1j, mask_bit
-    return result_real+result_imag*1j, True
+    iris_h, iris_w = iris.shape
+    filter_h, filter_w = filter_real.shape
+    x_start = x - filter_w // 2
+    y_start = y - filter_h // 2
+    result_real = 0.0
+    result_imag = 0.0
+    is_valid = True
+
+    for filter_row in range(filter_h):
+        iris_row = y_start + filter_row
+        if iris_row < 0 or iris_row >= iris_h:
+            if mask is not None:
+                is_valid = False
+            continue
+
+        for filter_col in range(filter_w):
+            iris_col = (x_start + filter_col) % iris_w
+            pixel = iris[iris_row, iris_col]
+            result_real += filter_real[filter_row, filter_col] * pixel
+            result_imag += filter_imag[filter_row, filter_col] * pixel
+
+            if mask is not None and mask[iris_row, iris_col] != 255:
+                is_valid = False
+
+    return result_real + result_imag * 1j, is_valid
    
 
 def complex_to_bits(z, mask_bit_list):
@@ -129,9 +145,9 @@ def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position,
         for j in range(h//y_stride):
             x = x_start+x_stride*i 
             y = y_start+y_stride*j
-            result, mask_bit = apply_filter(iris, filter_real, filter_imag, x, y, mask)
+            result, is_valid = apply_filter(iris, filter_real, filter_imag, x, y, mask)
             results[i*h//y_stride+j] = result
-            mask_bits[i*h//y_stride+j] = mask_bit
+            mask_bits[i*h//y_stride+j] = is_valid
     return results, mask_bits
 
 
