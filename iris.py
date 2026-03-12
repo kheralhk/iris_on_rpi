@@ -168,11 +168,10 @@ class IrisClassifier():
     
     @timeit
     def get_iris_code(self, iris, mask=None, offset=0):
-        func_t0 = time.perf_counter()
-        bits = np.array([], dtype=np.bool)
-        filters = np.array([], dtype=np.uint8)
-        mask_bits = np.array([], dtype=np.bool)
-        loop_t0 = time.perf_counter()
+        bit_chunks = []
+        filter_chunks = []
+        mask_chunks = []
+
         for i, (filter_real, filter_imag) in enumerate(self._filters):
             t0 = time.perf_counter()
             start_x, start_y = self._filter_settings[i]["start_position"]
@@ -186,14 +185,16 @@ class IrisClassifier():
                 mask,
             )
             t1 = time.perf_counter()
-            print(f"[IrisClassifier.get_iris_code] filter {i}: apply_filter_to_iris took {(t1 - t0):.3f} seconds")
             
             new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
-            filter = np.ones_like(new_bits)*i
-            bits = np.concat([bits,new_bits])
-            filters = np.concat([filters, filter])
-            mask_bits = np.concat([mask_bits, mask_bit])
-                    
+            filter_ids = np.full(new_bits.shape, i, dtype=np.uint8)
+            bit_chunks.append(new_bits)
+            filter_chunks.append(filter_ids)
+            mask_chunks.append(new_mask_bits)
+            
+            bits = np.concatenate(bit_chunks)
+            filters = np.cnocatenate(filter_chunks)
+            mask_chunks.concatenate(mask_chunks)
         return bits, mask_bits, filters
     
     @timeit
