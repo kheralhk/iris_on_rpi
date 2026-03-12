@@ -168,9 +168,9 @@ class IrisClassifier():
     
     @timeit
     def get_iris_code(self, iris, mask=None, offset=0):
-        bits = np.array([], dtype=np.bool)
-        filters = np.array([], dtype=np.uint8)
-        mask_bits = np.array([], dtype=np.bool)
+        bit_chunks = []
+        filter_chunks = []
+        mask_chunks = []
         for i, (filter_real, filter_imag) in enumerate(self._filters):
             t0 = time.perf_counter()
             start_x, start_y = self._filter_settings[i]["start_position"]
@@ -185,12 +185,15 @@ class IrisClassifier():
             )
             t1 = time.perf_counter()
             
-            new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
-            filter = np.ones_like(new_bits)*i
-            bits = np.concat([bits,new_bits])
-            filters = np.concat([filters, filter])
-            mask_bits = np.concat([mask_bits, mask_bit])
+            new_bits, new_mask_bits = complex_to_bits(result, mask_bit_list)
+            filter_ids = np.full(new_bits.shape, i, dtype=np.uint8)
+            bit_chunks.append(new_bits)
+            filter_chunks.append(filter_ids)
+            mask_chunks.append(new_mask_bits)
                     
+        bits = np.concatenate(bit_chunks)
+        filters = np.concatenate(filter_chunks)
+        mask_bits = np.concatenate(mask_chunks)
         return bits, mask_bits, filters
     
     @timeit
