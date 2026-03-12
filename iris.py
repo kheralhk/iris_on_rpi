@@ -137,17 +137,44 @@ def get_patch(img, x, y, w, h):
 @nb.njit
 def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position, mask=None):
     x_stride, y_stride = stride
-    x_start, y_start = start_position
-    h, w = iris.shape
-    results = np.zeros(w//x_stride*h//y_stride, dtype=np.complex128)
-    mask_bits = np.zeros(w//x_stride*h//y_stride, dtype=np.bool)
-    for i in range(w//x_stride):
-        for j in range(h//y_stride):
-            x = x_start+x_stride*i 
-            y = y_start+y_stride*j
-            result, is_valid = apply_filter(iris, filter_real, filter_imag, x, y, mask)
-            results[i*h//y_stride+j] = result
-            mask_bits[i*h//y_stride+j] = is_valid
+    x_center_start, y_center_start = start_position
+    iris_h, iris_w = iris.shape
+    filter_h, filter_w = filter_real.shape
+    x_steps = iris_w // x_stride
+    y_steps = iris_h // y_stride
+    results = np.zeros(x_steps * y_steps, dtype=np.complex128)
+    mask_bits = np.zeros(x_steps * y_steps, dtype=np.bool)
+
+    for x_index in range(x_steps):
+        for y_index in range(y_steps):
+            x_center = x_center_start + x_stride * x_index
+            y_center = y_center_start + y_stride * y_index
+            x_start = x_center - filter_w // 2
+            y_start = y_center - filter_h // 2
+            result_real = 0.0
+            result_imag = 0.0
+            is_valid = True
+
+            for filter_row in range(filter_h):
+                iris_row = y_start + filter_row
+                if iris_row < 0 or iris_row >= iris_h:
+                    if mask is not None:
+                        is_valid = False
+                    continue
+
+                for filter_col in range(filter_w):
+                    iris_col = (x_start + filter_col) % iris_w
+                    pixel = iris[iris_row, iris_col]
+                    result_real += filter_real[filter_row, filter_col] * pixel
+                    result_imag += filter_imag[filter_row, filter_col] * pixel
+
+                    if mask is not None and mask[iris_row, iris_col] != 255:
+                        is_valid = False
+
+            result_index = x_index * y_steps + y_index
+            results[result_index] = result_real + result_imag * 1j
+            mask_bits[result_index] = is_valid
+
     return results, mask_bits
 
 
