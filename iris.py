@@ -69,12 +69,10 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
     return gabor
 
 @nb.njit
-def apply_filter(iris, filter, x, y, mask=None):
+def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
     """Filters should have 0 DC"""
-    h, w = filter.shape
+    h, w = filter_real.shape
     patch = get_patch(iris, x, y, w, h)
-    filter_real = np.real(filter)
-    filter_imag = np.imag(filter)
     result_real = np.sum(filter_real * patch)
     result_imag = np.sum(filter_imag * patch)
     if mask is not None:
@@ -121,7 +119,7 @@ def get_patch(img, x, y, w, h):
     return patch
 
 @nb.njit
-def apply_filter_to_iris(iris, filter, stride, start_position, mask=None):
+def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position, mask=None):
     x_stride, y_stride = stride
     x_start, y_start = start_position
     h, w = iris.shape
@@ -131,7 +129,7 @@ def apply_filter_to_iris(iris, filter, stride, start_position, mask=None):
         for j in range(h//y_stride):
             x = x_start+x_stride*i 
             y = y_start+y_stride*j
-            result, mask_bit = apply_filter(iris, filter, x, y, mask)
+            result, mask_bit = apply_filter(iris, filter_real, filter_imag, x, y, mask)
             results[i*h//y_stride+j] = result
             mask_bits[i*h//y_stride+j] = mask_bit
     return results, mask_bits
@@ -160,8 +158,7 @@ class IrisClassifier():
             imag_filter = np.imag(filter)
             real_filter = real_filter - np.mean(real_filter)
             imag_filter = imag_filter - np.mean(imag_filter)
-            filter = real_filter + imag_filter*1j
-            self._filters.append(filter)
+            self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
 
     @timeit
@@ -171,24 +168,22 @@ class IrisClassifier():
     
     @timeit
     def get_iris_code(self, iris, mask=None, offset=0):
-        func_t0 = time.perf_counter()
         bits = np.array([], dtype=np.bool)
         filters = np.array([], dtype=np.uint8)
         mask_bits = np.array([], dtype=np.bool)
-        loop_t0 = time.perf_counter()
-        for i, filter in enumerate(self._filters):
+        for i, (filter_real, filter_imag) in enumerate(self._filters):
             t0 = time.perf_counter()
             start_x, start_y = self._filter_settings[i]["start_position"]
             start_pos = (start_x + offset, start_y)
             result, mask_bit_list = apply_filter_to_iris(
                 iris,
-                filter,
+                filter_real,
+                filter_imag,
                 self._filter_settings[i]["stride"],
                 start_pos,
                 mask,
             )
             t1 = time.perf_counter()
-            print(f"[IrisClassifier.get_iris_code] filter {i}: apply_filter_to_iris took {(t1 - t0):.3f} seconds")
             
             new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
             filter = np.ones_like(new_bits)*i
