@@ -2,7 +2,6 @@
 
 import cv2 as cv
 import numpy as np
-import numba as nb
 import subprocess
 import tempfile
 import time
@@ -10,7 +9,7 @@ from profiling import timeit, span
 from pathlib import Path
 tmp = Path(tempfile.gettempdir())
 
-
+@timeit
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
     mask = np.bitwise_and(mask1, mask2)
@@ -68,7 +67,7 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
     gabor = gaussian * complex_sinusoid
     return gabor
 
-@nb.njit
+@timeit
 def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
     """Filters should have 0 DC"""
     h, w = filter_real.shape
@@ -81,7 +80,7 @@ def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
         return result_real+result_imag*1j, mask_bit
     return result_real+result_imag*1j, True
    
-
+@timeit
 def complex_to_bits(z, mask_bit_list):
     real = (z.real >= 0).astype(np.bool)
     imag = (z.imag >= 0).astype(np.bool)
@@ -93,7 +92,7 @@ def complex_to_bits(z, mask_bit_list):
     mask_bits[1::2] = mask_bit_list
     return result, mask_bits
 
-@nb.njit
+@timeit
 def get_patch(img, x, y, w, h):
     img_h, img_w = img.shape
     patch = np.zeros((h, w), dtype=img.dtype)
@@ -118,7 +117,7 @@ def get_patch(img, x, y, w, h):
 
     return patch
 
-@nb.njit
+@timeit
 def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position, mask=None):
     x_stride, y_stride = stride
     x_start, y_start = start_position
@@ -186,15 +185,15 @@ class IrisClassifier():
             )
             t1 = time.perf_counter()
             
-            new_bits, mask_bit = complex_to_bits(result, mask_bit_list)
+            new_bits, mask_bits = complex_to_bits(result, mask_bit_list)
             filter_ids = np.full(new_bits.shape, i, dtype=np.uint8)
             bit_chunks.append(new_bits)
             filter_chunks.append(filter_ids)
-            mask_chunks.append(new_mask_bits)
+            mask_chunks.append(mask_bits)
             
-            bits = np.concatenate(bit_chunks)
-            filters = np.cnocatenate(filter_chunks)
-            mask_chunks.concatenate(mask_chunks)
+        bits = np.concatenate(bit_chunks)
+        filters = np.concatenate(filter_chunks)
+        mask_bits = np.concatenate(mask_chunks)
         return bits, mask_bits, filters
     
     @timeit
