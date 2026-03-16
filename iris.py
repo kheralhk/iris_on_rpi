@@ -19,30 +19,6 @@ def hamming_distance(a,b,mask1, mask2):
         return 2.0
     return total/n
 
-@timeit
-def get_patches(img):
-    height = img.shape[0]
-    patches = []
-    width = img.shape[1]
-    for i in range(4):
-        x0 = height//4*i
-        x1 = height//4*(i+1)
-        for j in range(32):
-            y0 = width//32*j
-            y1 = width//32*(j+1)
-            patches.append(img[x0:x1, y0:y1])
-    return patches
-
-@timeit
-def get_filters(sigma=2, gamma=1):
-    kernels = []
-    angles = [np.pi/4, -np.pi/4, 0, np.pi/2]
-    periods = [4, 8]
-    for angle in angles:
-        for period in periods:
-            kernel = complex_gabor_kernel((15,15), sigma, angle, period, 0, gamma)
-            kernels.append(kernel)
-    return kernels
 
 @timeit
 def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
