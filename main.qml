@@ -10,9 +10,6 @@ ApplicationWindow {
     height: 800
     title: "Camera App"
     
-    leftPadding: 12
-    rightPadding: 12
-
     Camera {
         id: camera
         active: true
@@ -45,6 +42,7 @@ ApplicationWindow {
 
     Item {
         anchors.fill: parent
+        anchors.margins: 12
 
         VideoOutput {
             id: viewfinder
