@@ -1,11 +1,10 @@
-# Project specific ignores
-dataset/
+analysis/dataset/
 extra_files/
 captures/
 iriscodes.npy/
+analysis/output/
 wahet
 *.npy
-
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
