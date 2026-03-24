@@ -5,9 +5,10 @@ import numpy as np
 import subprocess
 import tempfile
 import time
-from profiling import timeit, span
+from analysis.profiling import timeit, span
 from pathlib import Path
 tmp = Path(tempfile.gettempdir())
+WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
 
 @timeit
 def hamming_distance(a,b,mask1, mask2):
@@ -114,7 +115,7 @@ def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position,
 def get_iris_band(img):
     cv.imwrite(tmp/"input.png", img)
     with span("wahet"):
-        subprocess.run(["./wahet", "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True
+        subprocess.run([str(WAHET_BINARY), "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True
         )
     image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
     mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)
@@ -182,4 +183,3 @@ class IrisClassifier():
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=i-rotation//2)
             scores[i] = hamming_distance(bits, iris_code, mask, iris_code_mask)
         return (np.min(scores), np.argmin(scores)-rotation//2)
-
