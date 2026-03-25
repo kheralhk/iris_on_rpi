@@ -21,6 +21,17 @@ def hamming_distance(a,b,mask1, mask2):
         return 2.0
     return total/n
 
+@timeit
+def hamming_distances(a, b, masks_a, mask_b):
+    diff = np.bitwise_xor(a, b)
+    mask = np.bitwise_and(masks_a, mask_b)
+    total = np.sum(np.bitwise_and(diff, mask), axis=1)
+    n = np.sum(mask, axis=1)
+    scores = np.full(a.shape[0], 2.0, dtype=np.float64)
+    valid = n > 0
+    scores[valid] = total[valid] / n[valid]
+    return scores
+
 
 @timeit
 def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
@@ -156,6 +167,74 @@ def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position,
     mask_bits = np.all(sampled_mask == 255, axis=(2, 3)).T.reshape(-1)
     return results, mask_bits
 
+@timeit
+def apply_filter_to_iris_offsets(iris, filter_real, filter_imag, stride, start_positions, mask=None):
+    x_stride, y_stride = stride
+    iris_h, iris_w = iris.shape
+    filter_h, filter_w = filter_real.shape
+    num_x = iris_w // x_stride
+
+    start_positions = np.asarray(start_positions, dtype=np.int64)
+    x_starts = start_positions[:, 0]
+    y_starts = start_positions[:, 1]
+    if not np.all(y_starts == y_starts[0]):
+        raise ValueError("All start positions must share the same y coordinate.")
+
+    x_half = filter_w // 2
+    y_half = filter_h // 2
+    y_bottom = filter_h - y_half - 1
+    x_right = filter_w - x_half - 1
+    num_y = iris_h // y_stride
+    y_positions = y_starts[0] + y_stride * np.arange(num_y)
+    extra_top = max(0, -int(y_positions.min()))
+    extra_bottom = max(0, int(y_positions.max()) - (iris_h - 1))
+
+    padded_iris = np.pad(
+        iris,
+        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
+        mode="constant",
+    )
+    wrapped_iris = np.concatenate(
+        (
+            padded_iris[:, -x_half:] if x_half else padded_iris[:, :0],
+            padded_iris,
+            padded_iris[:, :x_right] if x_right else padded_iris[:, :0],
+        ),
+        axis=1,
+    )
+
+    iris_windows = sliding_window_view(wrapped_iris, (filter_h, filter_w))
+    sampled_rows = iris_windows[y_positions + extra_top]
+    x_positions = (x_starts[:, None] + x_stride * np.arange(num_x)) % iris_w
+    sampled_iris = sampled_rows[:, x_positions, :, :]
+
+    result_real = np.einsum("yoxij,ij->yox", sampled_iris, filter_real, optimize=True)
+    result_imag = np.einsum("yoxij,ij->yox", sampled_iris, filter_imag, optimize=True)
+    results = (result_real + result_imag * 1j).transpose(1, 2, 0).reshape(len(start_positions), -1)
+
+    if mask is None:
+        mask_bits = np.ones(results.shape, dtype=np.bool)
+        return results, mask_bits
+
+    padded_mask = np.pad(
+        mask,
+        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
+        mode="constant",
+    )
+    wrapped_mask = np.concatenate(
+        (
+            padded_mask[:, -x_half:] if x_half else padded_mask[:, :0],
+            padded_mask,
+            padded_mask[:, :x_right] if x_right else padded_mask[:, :0],
+        ),
+        axis=1,
+    )
+    mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
+    sampled_mask_rows = mask_windows[y_positions + extra_top]
+    sampled_mask = sampled_mask_rows[:, x_positions, :, :]
+    mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    return results, mask_bits
+
 
 @timeit
 def get_iris_band(img):
@@ -218,14 +297,54 @@ class IrisClassifier():
         filters = np.concatenate(filter_chunks)
         mask_bits = np.concatenate(mask_chunks)
         return bits, mask_bits, filters
+
+    @timeit
+    def get_iris_codes(self, iris, mask=None, offsets=(0,)):
+        offsets = np.asarray(offsets, dtype=np.int64)
+        bit_chunks = []
+        filter_chunks = []
+        mask_chunks = []
+
+        for i, (filter_real, filter_imag) in enumerate(self._filters):
+            start_x, start_y = self._filter_settings[i]["start_position"]
+            start_positions = np.column_stack(
+                (
+                    start_x + offsets,
+                    np.full(offsets.shape, start_y, dtype=np.int64),
+                )
+            )
+            results, mask_bit_lists = apply_filter_to_iris_offsets(
+                iris,
+                filter_real,
+                filter_imag,
+                self._filter_settings[i]["stride"],
+                start_positions,
+                mask,
+            )
+
+            filter_bits = []
+            filter_masks = []
+            for result, mask_bit_list in zip(results, mask_bit_lists):
+                new_bits, mask_bits = complex_to_bits(result, mask_bit_list)
+                filter_bits.append(new_bits)
+                filter_masks.append(mask_bits)
+
+            bit_chunks.append(np.stack(filter_bits, axis=0))
+            mask_chunks.append(np.stack(filter_masks, axis=0))
+            filter_ids = np.full((len(offsets), filter_bits[0].shape[0]), i, dtype=np.uint8)
+            filter_chunks.append(filter_ids)
+
+        bits = np.concatenate(bit_chunks, axis=1)
+        filters = np.concatenate(filter_chunks, axis=1)
+        mask_bits = np.concatenate(mask_chunks, axis=1)
+        return bits, mask_bits, filters
     
     @timeit
     def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
             return (hamming_distance(bits, iris_code, mask, iris_code_mask), 0)
-        scores = np.empty(rotation)
-        for i in range(rotation):
-            bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=i-rotation//2)
-            scores[i] = hamming_distance(bits, iris_code, mask, iris_code_mask)
+        offsets = np.arange(rotation) - rotation // 2
+        bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
+        scores = hamming_distances(bits, iris_code, masks, iris_code_mask)
         return (np.min(scores), np.argmin(scores)-rotation//2)
