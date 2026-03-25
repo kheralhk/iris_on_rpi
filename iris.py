@@ -10,6 +10,7 @@ from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
 tmp = Path(tempfile.gettempdir())
 WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
+PATCH_VALID_COVERAGE = 0.98
 
 @timeit
 def hamming_distance(a,b,mask1, mask2):
@@ -65,7 +66,7 @@ def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
     result_imag = np.sum(filter_imag * patch)
     if mask is not None:
         patch = get_patch(mask, x, y, w, h)
-        mask_bit = np.all(patch == 255)
+        mask_bit = np.mean(patch == 255) >= PATCH_VALID_COVERAGE
         return result_real+result_imag*1j, mask_bit
     return result_real+result_imag*1j, True
    
@@ -164,7 +165,8 @@ def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position,
     )
     mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
     sampled_mask = mask_windows[y_positions + extra_top][:, x_positions]
-    mask_bits = np.all(sampled_mask == 255, axis=(2, 3)).T.reshape(-1)
+    mask_coverage = np.mean(sampled_mask == 255, axis=(2, 3)).T.reshape(-1)
+    mask_bits = mask_coverage >= PATCH_VALID_COVERAGE
     return results, mask_bits
 
 @timeit
@@ -232,7 +234,8 @@ def apply_filter_to_iris_offsets(iris, filter_real, filter_imag, stride, start_p
     mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
     sampled_mask_rows = mask_windows[y_positions + extra_top]
     sampled_mask = sampled_mask_rows[:, x_positions, :, :]
-    mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    mask_coverage = np.mean(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    mask_bits = mask_coverage >= PATCH_VALID_COVERAGE
     return results, mask_bits
 
 
