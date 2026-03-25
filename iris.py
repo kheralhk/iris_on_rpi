@@ -7,6 +7,7 @@ import tempfile
 import time
 from analysis.profiling import timeit, span
 from pathlib import Path
+from numpy.lib.stride_tricks import sliding_window_view
 tmp = Path(tempfile.gettempdir())
 WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
 
@@ -98,16 +99,61 @@ def get_patch(img, x, y, w, h):
 def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position, mask=None):
     x_stride, y_stride = stride
     x_start, y_start = start_position
-    h, w = iris.shape
-    results = np.zeros(w//x_stride*h//y_stride, dtype=np.complex128)
-    mask_bits = np.zeros(w//x_stride*h//y_stride, dtype=np.bool)
-    for i in range(w//x_stride):
-        for j in range(h//y_stride):
-            x = x_start+x_stride*i 
-            y = y_start+y_stride*j
-            result, mask_bit = apply_filter(iris, filter_real, filter_imag, x, y, mask)
-            results[i*h//y_stride+j] = result
-            mask_bits[i*h//y_stride+j] = mask_bit
+    iris_h, iris_w = iris.shape
+    filter_h, filter_w = filter_real.shape
+    num_x = iris_w // x_stride
+    num_y = iris_h // y_stride
+
+    x_half = filter_w // 2
+    y_half = filter_h // 2
+    y_bottom = filter_h - y_half - 1
+    x_right = filter_w - x_half - 1
+    x_positions = (x_start + x_stride * np.arange(num_x)) % iris_w
+    y_positions = y_start + y_stride * np.arange(num_y)
+    extra_top = max(0, -int(y_positions.min()))
+    extra_bottom = max(0, int(y_positions.max()) - (iris_h - 1))
+
+    padded_iris = np.pad(
+        iris,
+        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
+        mode="constant",
+    )
+    wrapped_iris = np.concatenate(
+        (
+            padded_iris[:, -x_half:] if x_half else padded_iris[:, :0],
+            padded_iris,
+            padded_iris[:, :x_right] if x_right else padded_iris[:, :0],
+        ),
+        axis=1,
+    )
+
+    iris_windows = sliding_window_view(wrapped_iris, (filter_h, filter_w))
+    sampled_iris = iris_windows[y_positions + extra_top][:, x_positions]
+
+    result_real = np.einsum("yxij,ij->yx", sampled_iris, filter_real, optimize=True)
+    result_imag = np.einsum("yxij,ij->yx", sampled_iris, filter_imag, optimize=True)
+    results = (result_real + result_imag * 1j).T.reshape(-1)
+
+    if mask is None:
+        mask_bits = np.ones(results.shape, dtype=np.bool)
+        return results, mask_bits
+
+    padded_mask = np.pad(
+        mask,
+        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
+        mode="constant",
+    )
+    wrapped_mask = np.concatenate(
+        (
+            padded_mask[:, -x_half:] if x_half else padded_mask[:, :0],
+            padded_mask,
+            padded_mask[:, :x_right] if x_right else padded_mask[:, :0],
+        ),
+        axis=1,
+    )
+    mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
+    sampled_mask = mask_windows[y_positions + extra_top][:, x_positions]
+    mask_bits = np.all(sampled_mask == 255, axis=(2, 3)).T.reshape(-1)
     return results, mask_bits
 
 
