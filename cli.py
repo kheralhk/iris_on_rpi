@@ -88,7 +88,13 @@ def compare_iris_code(filename, code_path, rotation=21):
         # (2, L)
         iris_code = code[0]
         mask_code = code[1]
-    score, _ = iris_classifier.compare_iris_code_and_iris(iris, iris_code, mask, mask_code)
+    score, _ = iris_classifier.compare_iris_code_and_iris(
+        iris,
+        iris_code,
+        mask,
+        mask_code,
+        rotation=rotation,
+    )
     click.echo(score)
     
 @cli.command()
