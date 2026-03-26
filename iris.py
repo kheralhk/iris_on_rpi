@@ -5,12 +5,12 @@ import numpy as np
 import subprocess
 import tempfile
 import time
-from analysis.profiling import timeit, span
+from profiling import timeit, span
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
 tmp = Path(tempfile.gettempdir())
 WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
-PATCH_VALID_COVERAGE = 0.98
+PATCH_VALID_COVERAGE = 0.1
 
 @timeit
 def hamming_distance(a,b,mask1, mask2):
