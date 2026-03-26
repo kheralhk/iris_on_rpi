@@ -1,6 +1,7 @@
 improve_filters/
 extra_files/
 captures/
+dataset/
 
 iriscodes.npy/
 analysis/output/
