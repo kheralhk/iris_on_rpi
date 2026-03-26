@@ -2,7 +2,7 @@
 
 import click
 import cv2 as cv
-from iris import get_iris_band, IrisClassifier, hamming_distance
+from iris import get_iris_band, IrisClassifier, hamming_distances
 from filters import filters
 import numpy as np
 
@@ -88,12 +88,13 @@ def compare_iris_code(filename, code_path, rotation=21):
         # (2, L)
         iris_code = code[0]
         mask_code = code[1]
+    search_rotation = rotation if rotation > 1 else None
     score, _ = iris_classifier.compare_iris_code_and_iris(
         iris,
         iris_code,
         mask,
         mask_code,
-        rotation=rotation,
+        rotation=search_rotation,
     )
     click.echo(score)
     
@@ -108,25 +109,20 @@ def find(filename, codes_path, rotation, threshold):
     
     img = cv.imread(filename)
     iris, mask = get_iris_band(img)
-    
-    iris_code, mask_code, _ = iris_classifier.get_iris_code(iris, mask, offset=0)
-    
-    iris_codes = np.zeros((rotation, iris_code.shape[0]), dtype=np.bool)
-    mask_codes = np.zeros((rotation, iris_code.shape[0]), dtype=np.bool)
-    
-    for i in range(rotation):
-        iris_codes[i], mask_codes[i], _ = iris_classifier.get_iris_code(iris, mask, offset=i-rotation//2)
+
+    offsets = np.arange(rotation) - rotation // 2
+    iris_codes, mask_codes, _ = iris_classifier.get_iris_codes(iris, mask, offsets=offsets)
     
     best_match = None
     best_score = float('inf')
 
     # Evaluate all database entries across all rotations and keep the global best
     for j in range(codes.shape[1]):
-        for i in range(rotation):
-            curr_score = hamming_distance(iris_codes[i], codes[0, j], mask_codes[i], codes[1, j])
-            if curr_score < best_score:
-                best_score = curr_score
-                best_match = j
+        scores = hamming_distances(iris_codes, codes[0, j], mask_codes, codes[1, j])
+        curr_score = float(np.min(scores))
+        if curr_score < best_score:
+            best_score = curr_score
+            best_match = j
 
     click.echo("idx: " + str(best_match))
     click.echo("Score: " + str(best_score))
@@ -168,4 +164,3 @@ def enroll(filename, codes_path):
 
 if __name__ == '__main__':
     cli()
-
