@@ -4,7 +4,6 @@ import cv2 as cv
 import numpy as np
 import subprocess
 import tempfile
-import time
 from profiling import timeit, span
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
@@ -58,19 +57,6 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
     return gabor
 
 @timeit
-def apply_filter(iris, filter_real, filter_imag, x, y, mask=None):
-    """Filters should have 0 DC"""
-    h, w = filter_real.shape
-    patch = get_patch(iris, x, y, w, h)
-    result_real = np.sum(filter_real * patch)
-    result_imag = np.sum(filter_imag * patch)
-    if mask is not None:
-        patch = get_patch(mask, x, y, w, h)
-        mask_bit = np.mean(patch == 255) >= PATCH_VALID_COVERAGE
-        return result_real+result_imag*1j, mask_bit
-    return result_real+result_imag*1j, True
-   
-@timeit
 def complex_to_bits(z, mask_bit_list):
     real = (z.real >= 0).astype(np.bool)
     imag = (z.imag >= 0).astype(np.bool)
@@ -82,95 +68,7 @@ def complex_to_bits(z, mask_bit_list):
     mask_bits[1::2] = mask_bit_list
     return result, mask_bits
 
-@timeit
-def get_patch(img, x, y, w, h):
-    img_h, img_w = img.shape
-    patch = np.zeros((h, w), dtype=img.dtype)
-
-    # Wrap x and generate x indices
-    x_indices = (np.arange(x - w // 2, x - w // 2 + w) % img_w)
-
-    # Compute y range and valid bounds
-    y_start = y - h // 2
-    y_stop = y_start + h
-
-    # Determine valid range in image
-    y_valid_start = max(y_start, 0)
-    y_valid_stop = min(y_stop, img_h)
-
-    # Determine where to place the valid rows in the patch
-    patch_y_start = y_valid_start - y_start
-    patch_y_stop = patch_y_start + (y_valid_stop - y_valid_start)
-
-    if patch_y_stop > patch_y_start:  # Only fill if there's something valid
-        patch[patch_y_start:patch_y_stop, :] = img[y_valid_start:y_valid_stop, :][:, x_indices]
-
-    return patch
-
-@timeit
-def apply_filter_to_iris(iris, filter_real, filter_imag, stride, start_position, mask=None):
-    x_stride, y_stride = stride
-    x_start, y_start = start_position
-    iris_h, iris_w = iris.shape
-    filter_h, filter_w = filter_real.shape
-    num_x = iris_w // x_stride
-    num_y = iris_h // y_stride
-
-    x_half = filter_w // 2
-    y_half = filter_h // 2
-    y_bottom = filter_h - y_half - 1
-    x_right = filter_w - x_half - 1
-    x_positions = (x_start + x_stride * np.arange(num_x)) % iris_w
-    y_positions = y_start + y_stride * np.arange(num_y)
-    extra_top = max(0, -int(y_positions.min()))
-    extra_bottom = max(0, int(y_positions.max()) - (iris_h - 1))
-
-    padded_iris = np.pad(
-        iris,
-        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
-        mode="constant",
-    )
-    wrapped_iris = np.concatenate(
-        (
-            padded_iris[:, -x_half:] if x_half else padded_iris[:, :0],
-            padded_iris,
-            padded_iris[:, :x_right] if x_right else padded_iris[:, :0],
-        ),
-        axis=1,
-    )
-
-    iris_windows = sliding_window_view(wrapped_iris, (filter_h, filter_w))
-    sampled_iris = iris_windows[y_positions + extra_top][:, x_positions]
-
-    result_real = np.einsum("yxij,ij->yx", sampled_iris, filter_real, optimize=True)
-    result_imag = np.einsum("yxij,ij->yx", sampled_iris, filter_imag, optimize=True)
-    results = (result_real + result_imag * 1j).T.reshape(-1)
-
-    if mask is None:
-        mask_bits = np.ones(results.shape, dtype=np.bool)
-        return results, mask_bits
-
-    padded_mask = np.pad(
-        mask,
-        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
-        mode="constant",
-    )
-    wrapped_mask = np.concatenate(
-        (
-            padded_mask[:, -x_half:] if x_half else padded_mask[:, :0],
-            padded_mask,
-            padded_mask[:, :x_right] if x_right else padded_mask[:, :0],
-        ),
-        axis=1,
-    )
-    mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
-    sampled_mask = mask_windows[y_positions + extra_top][:, x_positions]
-    mask_coverage = np.mean(sampled_mask == 255, axis=(2, 3)).T.reshape(-1)
-    mask_bits = mask_coverage >= PATCH_VALID_COVERAGE
-    return results, mask_bits
-
-@timeit
-def apply_filter_to_iris_offsets(iris, filter_real, filter_imag, stride, start_positions, mask=None):
+def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_positions, mask=None):
     x_stride, y_stride = stride
     iris_h, iris_w = iris.shape
     filter_h, filter_w = filter_real.shape
@@ -238,7 +136,6 @@ def apply_filter_to_iris_offsets(iris, filter_real, filter_imag, stride, start_p
     mask_bits = mask_coverage >= PATCH_VALID_COVERAGE
     return results, mask_bits
 
-
 @timeit
 def get_iris_band(img):
     cv.imwrite(tmp/"input.png", img)
@@ -270,39 +167,7 @@ class IrisClassifier():
         bits_1, mask_1, _ = self.get_iris_code(iris1, mask1)
         return self.compare_iris_code_and_iris(iris2, bits_1, mask2, mask_1, rotation=rotation, offset=offset)
     
-    @timeit
-    def get_iris_code(self, iris, mask=None, offset=0):
-        bit_chunks = []
-        filter_chunks = []
-        mask_chunks = []
-
-        for i, (filter_real, filter_imag) in enumerate(self._filters):
-            t0 = time.perf_counter()
-            start_x, start_y = self._filter_settings[i]["start_position"]
-            start_pos = (start_x + offset, start_y)
-            result, mask_bit_list = apply_filter_to_iris(
-                iris,
-                filter_real,
-                filter_imag,
-                self._filter_settings[i]["stride"],
-                start_pos,
-                mask,
-            )
-            t1 = time.perf_counter()
-            
-            new_bits, mask_bits = complex_to_bits(result, mask_bit_list)
-            filter_ids = np.full(new_bits.shape, i, dtype=np.uint8)
-            bit_chunks.append(new_bits)
-            filter_chunks.append(filter_ids)
-            mask_chunks.append(mask_bits)
-            
-        bits = np.concatenate(bit_chunks)
-        filters = np.concatenate(filter_chunks)
-        mask_bits = np.concatenate(mask_chunks)
-        return bits, mask_bits, filters
-
-    @timeit
-    def get_iris_codes(self, iris, mask=None, offsets=(0,)):
+    def _encode_iris_offsets(self, iris, mask=None, offsets=(0,)):
         offsets = np.asarray(offsets, dtype=np.int64)
         bit_chunks = []
         filter_chunks = []
@@ -316,7 +181,7 @@ class IrisClassifier():
                     np.full(offsets.shape, start_y, dtype=np.int64),
                 )
             )
-            results, mask_bit_lists = apply_filter_to_iris_offsets(
+            results, mask_bit_lists = _apply_filter_grid_batch(
                 iris,
                 filter_real,
                 filter_imag,
@@ -340,6 +205,16 @@ class IrisClassifier():
         bits = np.concatenate(bit_chunks, axis=1)
         filters = np.concatenate(filter_chunks, axis=1)
         mask_bits = np.concatenate(mask_chunks, axis=1)
+        return bits, mask_bits, filters
+
+    @timeit
+    def get_iris_code(self, iris, mask=None, offset=0):
+        bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=(offset,))
+        return bits[0], mask_bits[0], filters[0]
+
+    @timeit
+    def get_iris_codes(self, iris, mask=None, offsets=(0,)):
+        bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=offsets)
         return bits, mask_bits, filters
     
     @timeit
