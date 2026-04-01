@@ -247,6 +247,10 @@ def save_results(output_path, pairwise, evaluation, labels, image_names, dataset
 def plot_results(scores, same_class, evaluation, figure_path=None):
     mated_scores = scores[same_class]
     non_mated_scores = scores[~same_class]
+    fpr = evaluation["fpr"]
+    positive_fpr = fpr[fpr > 0.0]
+    min_log_fpr = max(float(positive_fpr.min()) / 10.0, 1e-6) if positive_fpr.size else 1e-6
+    plot_fpr = np.maximum(fpr, min_log_fpr)
 
     sns.set_theme(style="whitegrid")
     figure, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -267,17 +271,19 @@ def plot_results(scores, same_class, evaluation, figure_path=None):
     axes[0].legend(loc="upper right")
 
     axes[1].plot(
-        evaluation["fpr"],
+        plot_fpr,
         evaluation["tpr"],
         color="#ff8c00",
         lw=2,
         label=f"ROC (AUC = {evaluation['roc_auc']:.4f}, EER = {evaluation['eer']:.4f})",
     )
-    axes[1].plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="#6c757d", lw=1)
+    chance_fpr = np.logspace(np.log10(min_log_fpr), 0.0, 200)
+    axes[1].plot(chance_fpr, chance_fpr, linestyle="--", color="#6c757d", lw=1)
     axes[1].set_title("ROC Curve")
-    axes[1].set_xlabel("False Positive Rate")
+    axes[1].set_xlabel("False Positive Rate (log scale)")
     axes[1].set_ylabel("True Positive Rate")
-    axes[1].set_xlim(0.0, 1.0)
+    axes[1].set_xscale("log")
+    axes[1].set_xlim(min_log_fpr, 1.0)
     axes[1].set_ylim(0.0, 1.0)
     axes[1].legend(loc="lower right")
 
@@ -317,6 +323,11 @@ def main():
         help="Output image path for the distribution/ROC figure. Defaults to fltr_ana_<dataset>.png",
     )
     parser.add_argument(
+        "--figure-name",
+        default=None,
+        help="Output filename for the figure inside the default output directory. Example: my_run.png",
+    )
+    parser.add_argument(
         "--rotation",
         type=int,
         default=21,
@@ -350,10 +361,17 @@ def main():
 
     if args.rotation < 1:
         raise ValueError("--rotation must be at least 1")
+    if args.figure_output and args.figure_name:
+        raise ValueError("Use either --figure-output or --figure-name, not both.")
 
     dataset_path, dataset_format = resolve_dataset(args.dataset_path, args.dataset_format)
     dataset_name = dataset_output_slug(dataset_format)
     figure_output = args.figure_output
+    if figure_output is None and args.figure_name is not None:
+        figure_name = args.figure_name
+        if Path(figure_name).suffix == "":
+            figure_name = f"{figure_name}.png"
+        figure_output = str(DEFAULT_OUTPUT_DIR / figure_name)
     if figure_output is None:
         figure_output = str(DEFAULT_OUTPUT_DIR / f"fltr_ana_{dataset_name}.png")
 
