@@ -2,14 +2,33 @@
 
 import cv2 as cv
 import numpy as np
+import os
 import subprocess
 import tempfile
 from profiling import timeit, span
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
+from segmentation_geometry import semantic_masks_to_band, DEFAULT_BAND_SHAPE
 tmp = Path(tempfile.gettempdir())
 WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
 PATCH_VALID_COVERAGE = 0.1
+DEFAULT_SEGMENTATION_BACKEND = os.environ.get("IRIS_SEGMENTATION_BACKEND", "wahet").strip().lower()
+UNET_ONNX_PATH = Path(
+    os.environ.get(
+        "IRIS_UNET_ONNX_PATH",
+        str(Path(__file__).resolve().parent / "models" / "iris_semseg_upp_scse_mobilenetv2.onnx"),
+    )
+)
+UNET_INPUT_SIZE = (
+    int(os.environ.get("IRIS_UNET_INPUT_WIDTH", 480)),
+    int(os.environ.get("IRIS_UNET_INPUT_HEIGHT", 640)),
+)
+UNET_THRESHOLD = float(os.environ.get("IRIS_UNET_THRESHOLD", 0.5))
+UNET_BAND_SHAPE = (
+    int(os.environ.get("IRIS_UNET_BAND_HEIGHT", DEFAULT_BAND_SHAPE[0])),
+    int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
+)
+_UNET_NET = None
 
 @timeit
 def hamming_distance(a,b,mask1, mask2):
@@ -137,7 +156,7 @@ def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_posit
     return results, mask_bits
 
 @timeit
-def get_iris_band(img):
+def _segment_with_wahet(img):
     cv.imwrite(tmp/"input.png", img)
     with span("wahet"):
         subprocess.run([str(WAHET_BINARY), "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True
@@ -145,6 +164,109 @@ def get_iris_band(img):
     image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
     mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)
     return image, mask
+
+
+def _resolve_dnn_backend(name):
+    mapping = {
+        "opencv": cv.dnn.DNN_BACKEND_OPENCV,
+    }
+    if hasattr(cv.dnn, "DNN_BACKEND_CUDA"):
+        mapping["cuda"] = cv.dnn.DNN_BACKEND_CUDA
+    return mapping.get(name)
+
+
+def _resolve_dnn_target(name):
+    mapping = {
+        "cpu": cv.dnn.DNN_TARGET_CPU,
+    }
+    if hasattr(cv.dnn, "DNN_TARGET_CUDA"):
+        mapping["cuda"] = cv.dnn.DNN_TARGET_CUDA
+    if hasattr(cv.dnn, "DNN_TARGET_CUDA_FP16"):
+        mapping["cuda_fp16"] = cv.dnn.DNN_TARGET_CUDA_FP16
+    return mapping.get(name)
+
+
+def _get_unet_net():
+    global _UNET_NET
+    if _UNET_NET is not None:
+        return _UNET_NET
+    if not UNET_ONNX_PATH.exists():
+        raise FileNotFoundError(
+            f"U-Net ONNX model not found at '{UNET_ONNX_PATH}'. "
+            "Set IRIS_UNET_ONNX_PATH or place the model there."
+        )
+    net = cv.dnn.readNetFromONNX(str(UNET_ONNX_PATH))
+    backend_name = os.environ.get("IRIS_UNET_DNN_BACKEND", "opencv").strip().lower()
+    target_name = os.environ.get("IRIS_UNET_DNN_TARGET", "cpu").strip().lower()
+    backend = _resolve_dnn_backend(backend_name)
+    target = _resolve_dnn_target(target_name)
+    if backend is not None:
+        net.setPreferableBackend(backend)
+    if target is not None:
+        net.setPreferableTarget(target)
+    _UNET_NET = net
+    return net
+
+
+def _sigmoid_if_needed(output):
+    output = np.asarray(output, dtype=np.float32)
+    if output.min() < 0.0 or output.max() > 1.0:
+        return 1.0 / (1.0 + np.exp(-output))
+    return output
+
+
+def predict_unet_masks(img):
+    gray = img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    resized = cv.resize(gray, UNET_INPUT_SIZE, interpolation=cv.INTER_LINEAR).astype(np.float32) / 255.0
+    rgb = np.repeat(resized[:, :, None], 3, axis=2)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = ((rgb - mean) / std).transpose(2, 0, 1)[None, :, :, :]
+
+    net = _get_unet_net()
+    net.setInput(normalized)
+    output = net.forward()
+    if output.ndim != 4 or output.shape[1] < 3:
+        raise RuntimeError(f"Unexpected U-Net output shape: {output.shape}")
+
+    probabilities = _sigmoid_if_needed(output[0])
+    image_h, image_w = gray.shape
+    resized_probs = np.stack(
+        [
+            cv.resize(probabilities[index], (image_w, image_h), interpolation=cv.INTER_LINEAR)
+            for index in range(probabilities.shape[0])
+        ],
+        axis=0,
+    )
+
+    # Worldcoin's published model card lists classes: eyeball, iris, pupil, eyelashes.
+    iris_mask = resized_probs[1] >= UNET_THRESHOLD
+    pupil_mask = resized_probs[2] >= UNET_THRESHOLD
+    eyelash_mask = resized_probs[3] >= UNET_THRESHOLD if resized_probs.shape[0] > 3 else np.zeros_like(iris_mask)
+    return gray, iris_mask, pupil_mask, eyelash_mask
+
+
+@timeit
+def _segment_with_unet(img):
+    gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(img)
+    return semantic_masks_to_band(
+        gray,
+        iris_mask=iris_mask,
+        pupil_mask=pupil_mask,
+        occlusion_mask=eyelash_mask,
+        band_shape=UNET_BAND_SHAPE,
+        prefer_ellipse=True,
+    )
+
+
+@timeit
+def get_iris_band(img, backend=None):
+    backend_name = (backend or DEFAULT_SEGMENTATION_BACKEND).strip().lower()
+    if backend_name == "wahet":
+        return _segment_with_wahet(img)
+    if backend_name == "unet":
+        return _segment_with_unet(img)
+    raise ValueError(f"Unsupported segmentation backend: {backend_name}")
 
 class IrisClassifier():
     def __init__(self, filters) -> None:
