@@ -5,11 +5,7 @@ from pathlib import Path
 
 LOWER_IS_BETTER_METRICS = {
     "eer",
-    "elapsed_seconds",
     "mean_seconds",
-    "median_seconds",
-    "min_seconds",
-    "max_seconds",
     "score",
 }
 
@@ -23,15 +19,18 @@ def pairwise_by_dataset(results):
     return {item["dataset_format"]: item for item in results.get("pairwise", [])}
 
 
-def speed_by_dataset(results):
-    lookup = {}
-    for item in results.get("speed", []):
-        operations = {op["name"]: op for op in item.get("operations", [])}
-        lookup[item["dataset_format"]] = {
-            "metadata": {key: value for key, value in item.items() if key != "operations"},
-            "operations": operations,
-        }
-    return lookup
+def speed_section(results):
+    speed = results.get("speed")
+    if speed is None:
+        return None
+    if isinstance(speed, list):
+        if not speed:
+            return None
+        speed = speed[0]
+    return {
+        "metadata": {key: value for key, value in speed.items() if key != "operations"},
+        "operations": {op["name"]: op for op in speed.get("operations", [])},
+    }
 
 
 def relative_percent(old, new):
@@ -40,19 +39,12 @@ def relative_percent(old, new):
     return ((new - old) / old) * 100.0
 
 
-def ratio(old, new):
-    if old == 0:
-        return None
-    return new / old
-
-
 def compare_metric(old, new, metric_name):
     result = {
         "old": old,
         "new": new,
         "delta": new - old,
         "relative_percent": relative_percent(old, new),
-        "ratio_new_over_old": ratio(old, new),
     }
     if metric_name in LOWER_IS_BETTER_METRICS:
         result["direction"] = "better" if new < old else "worse" if new > old else "same"
@@ -74,49 +66,46 @@ def compare_pairwise(old_results, new_results):
         comparison[dataset] = {
             "roc_auc": compare_metric(old_item["roc_auc"], new_item["roc_auc"], "roc_auc"),
             "eer": compare_metric(old_item["eer"], new_item["eer"], "eer"),
-            "elapsed_seconds": compare_metric(old_item["elapsed_seconds"], new_item["elapsed_seconds"], "elapsed_seconds"),
         }
     return comparison
 
 
 def compare_speed(old_results, new_results):
-    old_lookup = speed_by_dataset(old_results)
-    new_lookup = speed_by_dataset(new_results)
-    comparison = {}
-    for dataset in sorted(set(old_lookup) | set(new_lookup)):
-        old_item = old_lookup.get(dataset)
-        new_item = new_lookup.get(dataset)
-        if old_item is None or new_item is None:
-            comparison[dataset] = {"status": "missing_in_one_result"}
+    old_speed = speed_section(old_results)
+    new_speed = speed_section(new_results)
+    if old_speed is None or new_speed is None:
+        return {"status": "missing_in_one_result"}
+
+    op_names = sorted(set(old_speed["operations"]) | set(new_speed["operations"]))
+    comparison = {
+        "dataset_format": {
+            "old": old_speed["metadata"].get("dataset_format"),
+            "new": new_speed["metadata"].get("dataset_format"),
+        },
+        "segmentation_backend": {
+            "old": old_speed["metadata"].get("segmentation_backend"),
+            "new": new_speed["metadata"].get("segmentation_backend"),
+        },
+        "operations": {},
+    }
+
+    for op_name in op_names:
+        old_op = old_speed["operations"].get(op_name)
+        new_op = new_speed["operations"].get(op_name)
+        if old_op is None or new_op is None:
+            comparison["operations"][op_name] = {"status": "missing_in_one_result"}
             continue
+        comparison["operations"][op_name] = {
+            "mean_seconds": compare_metric(old_op["mean_seconds"], new_op["mean_seconds"], "mean_seconds"),
+        }
 
-        op_names = sorted(set(old_item["operations"]) | set(new_item["operations"]))
-        dataset_result = {}
-        for op_name in op_names:
-            old_op = old_item["operations"].get(op_name)
-            new_op = new_item["operations"].get(op_name)
-            if old_op is None or new_op is None:
-                dataset_result[op_name] = {"status": "missing_in_one_result"}
-                continue
-
-            op_result = {
-                "mean_seconds": compare_metric(old_op["mean_seconds"], new_op["mean_seconds"], "mean_seconds"),
-                "median_seconds": compare_metric(old_op["median_seconds"], new_op["median_seconds"], "median_seconds"),
-            }
-            if op_name == "compare_identical_image":
-                old_score = old_op.get("last_result", [None])[0]
-                new_score = new_op.get("last_result", [None])[0]
-                if old_score is not None and new_score is not None:
-                    op_result["score"] = compare_metric(old_score, new_score, "score")
-            dataset_result[op_name] = op_result
-        old_functional = old_item["metadata"].get("functional_summary")
-        new_functional = new_item["metadata"].get("functional_summary")
-        if old_functional is not None or new_functional is not None:
-            dataset_result["_functional_summary"] = {
-                "old": None if old_functional is None else old_functional.get("is_functional_iris_recognizer"),
-                "new": None if new_functional is None else new_functional.get("is_functional_iris_recognizer"),
-            }
-        comparison[dataset] = dataset_result
+    old_functional = old_speed["metadata"].get("functional_summary")
+    new_functional = new_speed["metadata"].get("functional_summary")
+    if old_functional is not None or new_functional is not None:
+        comparison["functional_summary"] = {
+            "old": None if old_functional is None else old_functional.get("is_functional_iris_recognizer"),
+            "new": None if new_functional is None else new_functional.get("is_functional_iris_recognizer"),
+        }
     return comparison
 
 
@@ -127,53 +116,40 @@ def print_pairwise(comparison):
         if "status" in metrics:
             print(f"  status: {metrics['status']}")
             continue
-        for metric_name in ("roc_auc", "eer", "elapsed_seconds"):
+        for metric_name in ("roc_auc", "eer"):
             metric = metrics[metric_name]
             rel = metric["relative_percent"]
-            ratio_value = metric["ratio_new_over_old"]
             rel_text = "n/a" if rel is None else f"{rel:+.2f}%"
-            ratio_text = "n/a" if ratio_value is None else f"{ratio_value:.3f}x"
             print(
                 f"  {metric_name}: {metric['old']:.6f} -> {metric['new']:.6f} "
-                f"({metric['direction']}, delta {metric['delta']:+.6f}, {rel_text}, ratio {ratio_text})"
+                f"({metric['direction']}, delta {metric['delta']:+.6f}, {rel_text})"
             )
 
 
 def print_speed(comparison):
     print("\nSpeed summary")
-    for dataset, operations in comparison.items():
-        print(f"- {dataset}")
-        if "status" in operations:
-            print(f"  status: {operations['status']}")
+    if "status" in comparison:
+        print(f"- status: {comparison['status']}")
+        return
+
+    print(
+        f"- dataset/backend: {comparison['dataset_format']['old']} / {comparison['segmentation_backend']['old']} "
+        f"-> {comparison['dataset_format']['new']} / {comparison['segmentation_backend']['new']}"
+    )
+    for op_name, metrics in comparison["operations"].items():
+        if "status" in metrics:
+            print(f"  {op_name}: {metrics['status']}")
             continue
-        for op_name, metrics in operations.items():
-            if op_name == "_functional_summary":
-                print(
-                    f"  functional recognizer: {metrics['old']} -> {metrics['new']}"
-                )
-                continue
-            if "status" in metrics:
-                print(f"  {op_name}: {metrics['status']}")
-                continue
-            mean_metric = metrics["mean_seconds"]
-            rel = mean_metric["relative_percent"]
-            ratio_value = mean_metric["ratio_new_over_old"]
-            rel_text = "n/a" if rel is None else f"{rel:+.2f}%"
-            ratio_text = "n/a" if ratio_value is None else f"{ratio_value:.3f}x"
-            print(
-                f"  {op_name}: {mean_metric['old']:.6f}s -> {mean_metric['new']:.6f}s "
-                f"({mean_metric['direction']}, delta {mean_metric['delta']:+.6f}s, {rel_text}, ratio {ratio_text})"
-            )
-            if "score" in metrics:
-                score_metric = metrics["score"]
-                rel = score_metric["relative_percent"]
-                ratio_value = score_metric["ratio_new_over_old"]
-                rel_text = "n/a" if rel is None else f"{rel:+.2f}%"
-                ratio_text = "n/a" if ratio_value is None else f"{ratio_value:.3f}x"
-                print(
-                    f"    identical score: {score_metric['old']:.6f} -> {score_metric['new']:.6f} "
-                    f"({score_metric['direction']}, delta {score_metric['delta']:+.6f}, {rel_text}, ratio {ratio_text})"
-                )
+        mean_metric = metrics["mean_seconds"]
+        rel = mean_metric["relative_percent"]
+        rel_text = "n/a" if rel is None else f"{rel:+.2f}%"
+        print(
+            f"  {op_name}: {mean_metric['old']:.6f}s -> {mean_metric['new']:.6f}s "
+            f"({mean_metric['direction']}, delta {mean_metric['delta']:+.6f}s, {rel_text})"
+        )
+    functional = comparison.get("functional_summary")
+    if functional is not None:
+        print(f"  functional recognizer: {functional['old']} -> {functional['new']}")
 
 
 def main():
