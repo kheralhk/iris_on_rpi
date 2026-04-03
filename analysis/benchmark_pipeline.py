@@ -27,7 +27,7 @@ from pairwise_iris_analysis import (
 )
 
 
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "pipeline_evaluation"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "benchmark_pipeline"
 DEFAULT_PAIRWISE_CONFIGS = {
     "casia-v1": {
         "max_samples": None,
@@ -160,6 +160,41 @@ def find_valid_images(dataset_path, dataset_format, count, segmentation_backend=
     return valid
 
 
+def find_speed_benchmark_samples(dataset_path, dataset_format, database_size, segmentation_backend=None):
+    images, labels, image_names = load_dataset(dataset_path, dataset_format)
+    label_to_samples = {}
+
+    def has_enough_samples():
+        for label, sample_group in label_to_samples.items():
+            if len(sample_group) < 2:
+                continue
+            impostor_count = sum(len(group) for other_label, group in label_to_samples.items() if other_label != label)
+            if impostor_count >= max(database_size - 1, 0):
+                return True
+        return False
+
+    for image, label, name in zip(images, labels, image_names):
+        iris_band, iris_mask = segment_with_optional_backend(image, segmentation_backend=segmentation_backend)
+        if iris_band is None or iris_mask is None:
+            continue
+        label_to_samples.setdefault(str(label), []).append(
+            {
+                "raw_image": image,
+                "iris_band": iris_band,
+                "iris_mask": iris_mask,
+                "label": str(label),
+                "image_name": str(name),
+            }
+        )
+        if has_enough_samples():
+            break
+
+    samples = []
+    for sample_group in label_to_samples.values():
+        samples.extend(sample_group)
+    return samples
+
+
 def build_database(classifier, samples):
     codes = []
     for sample in samples:
@@ -183,13 +218,21 @@ def select_benchmark_samples(samples, database_size):
 
     query = None
     compare_sample = None
-    for sample_group in label_to_samples.values():
+    for label, sample_group in label_to_samples.items():
         if len(sample_group) >= 2:
-            query = sample_group[0]
-            compare_sample = sample_group[1]
-            break
+            impostor_count = sum(
+                len(other_group)
+                for other_label, other_group in label_to_samples.items()
+                if other_label != label
+            )
+            if impostor_count >= max(database_size - 1, 0):
+                query = sample_group[0]
+                compare_sample = sample_group[1]
+                break
     if query is None or compare_sample is None:
-        raise RuntimeError("Need at least one identity with two valid images for baseline evaluation.")
+        raise RuntimeError(
+            "Need at least one identity with two valid images and enough impostors for the benchmark database."
+        )
 
     impostor_pool = []
     for label, sample_group in label_to_samples.items():
@@ -304,10 +347,10 @@ def build_functional_summary(operations):
 
 def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size, segmentation_backend=None):
     classifier = IrisClassifier(filters)
-    samples = find_valid_images(
+    samples = find_speed_benchmark_samples(
         dataset_path,
         dataset_format,
-        database_size + 2,
+        database_size,
         segmentation_backend=segmentation_backend,
     )
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
@@ -432,6 +475,11 @@ def main():
         help="Directory for JSON output.",
     )
     parser.add_argument(
+        "--output-name",
+        default="benchmark_results.json",
+        help="Filename for the JSON results inside --output-dir, or an absolute JSON path.",
+    )
+    parser.add_argument(
         "--segmentation-backend",
         default=None,
         help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
@@ -447,9 +495,14 @@ def main():
     if args.skip_pairwise and args.skip_speed:
         raise ValueError("At least one of pairwise or speed benchmarking must be enabled.")
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_name = Path(args.output_name).expanduser()
+    if output_name.is_absolute():
+        output_path = output_name.resolve()
+        output_dir = output_path.parent
+    else:
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        output_path = output_dir / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "pipeline_results.json"
 
     results = {
         "filters_count": int(len(filters)),
