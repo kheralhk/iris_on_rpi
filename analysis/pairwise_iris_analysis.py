@@ -68,7 +68,7 @@ def sample_dataset(
     return sampled_images, sampled_labels, sampled_image_names
 
 
-def precompute_codes(images, image_names, classifier, rotation):
+def precompute_codes(images, image_names, classifier, rotation, segmentation_backend=None):
     offsets = np.arange(rotation) - rotation // 2
     sample_count = len(images)
 
@@ -81,7 +81,7 @@ def precompute_codes(images, image_names, classifier, rotation):
         if index == 1 or index % 25 == 0 or index == sample_count:
             print(f"Precomputing iris codes: {index}/{sample_count}")
 
-        iris_band, iris_mask = get_iris_band(image)
+        iris_band, iris_mask = get_iris_band(image, backend=segmentation_backend)
         if iris_band is None or iris_mask is None:
             raise RuntimeError(
                 f"Segmentation failed for sample index {index - 1}: {image_names[index - 1]}"
@@ -357,6 +357,11 @@ def main():
         default=0,
         help="Random seed for deterministic subset sampling.",
     )
+    parser.add_argument(
+        "--segmentation-backend",
+        default=None,
+        help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
+    )
     args = parser.parse_args()
 
     if args.rotation < 1:
@@ -407,6 +412,7 @@ def main():
         image_names,
         classifier,
         args.rotation,
+        segmentation_backend=args.segmentation_backend,
     )
     pairwise = compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets)
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
