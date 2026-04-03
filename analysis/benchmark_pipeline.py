@@ -64,10 +64,6 @@ GET_IRIS_BAND_SUPPORTS_BACKEND = _supports_kwarg(get_iris_band, "backend")
 PRECOMPUTE_CODES_SUPPORTS_BACKEND = _supports_kwarg(precompute_codes, "segmentation_backend")
 
 
-def dataset_slug(dataset_format):
-    return dataset_format.replace("-", "")
-
-
 def format_result(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -128,36 +124,8 @@ def benchmark(name, runs, func):
         "name": name,
         "runs": int(runs),
         "mean_seconds": float(times.mean()),
-        "median_seconds": float(np.median(times)),
-        "min_seconds": float(times.min()),
-        "max_seconds": float(times.max()),
         "last_result": format_result(result),
     }
-
-
-def find_valid_images(dataset_path, dataset_format, count, segmentation_backend=None):
-    images, labels, image_names = load_dataset(dataset_path, dataset_format)
-    valid = []
-    for image, label, name in zip(images, labels, image_names):
-        iris_band, iris_mask = segment_with_optional_backend(image, segmentation_backend=segmentation_backend)
-        if iris_band is None or iris_mask is None:
-            continue
-        valid.append(
-            {
-                "raw_image": image,
-                "iris_band": iris_band,
-                "iris_mask": iris_mask,
-                "label": str(label),
-                "image_name": str(name),
-            }
-        )
-        if len(valid) >= count:
-            break
-    if len(valid) < count:
-        raise RuntimeError(
-            f"Needed {count} valid segmented samples for {dataset_format}, found only {len(valid)}."
-        )
-    return valid
 
 
 def find_speed_benchmark_samples(dataset_path, dataset_format, database_size, segmentation_backend=None):
@@ -275,17 +243,6 @@ def compare_image_operation(classifier, sample1, sample2, rotation):
     return score, offset
 
 
-def compare_identical_image_operation(classifier, sample, rotation):
-    score, offset = classifier(
-        sample["iris_band"],
-        sample["iris_band"],
-        sample["iris_mask"],
-        sample["iris_mask"],
-        rotation=rotation,
-    )
-    return score, offset
-
-
 def find_operation(classifier, sample, codes, rotation):
     offsets = np.arange(rotation) - rotation // 2
     iris_codes, mask_codes, _ = classifier.get_iris_codes(
@@ -304,41 +261,45 @@ def find_operation(classifier, sample, codes, rotation):
     return best_match, best_score
 
 
+def compare_iris_codes_operation(query_code, compare_code):
+    score = hamming_distances(
+        query_code[0][None, :],
+        compare_code[0],
+        query_code[1][None, :],
+        compare_code[1],
+    )[0]
+    return float(score)
+
+
 def build_functional_summary(operations):
     operation_lookup = {item["name"]: item for item in operations}
-    identical_score = float(operation_lookup["compare_identical_image"]["last_result"][0])
-    identical_offset = int(operation_lookup["compare_identical_image"]["last_result"][1])
     compare_score = float(operation_lookup["compare_image"]["last_result"][0])
+    compare_codes_score = float(operation_lookup["compare_iris_codes"]["last_result"])
     find_index = int(operation_lookup["find"]["last_result"][0])
     find_score = float(operation_lookup["find"]["last_result"][1])
 
-    identical_zero = np.isclose(identical_score, 0.0)
-    identical_centered = identical_offset == 0
     genuine_below_default_threshold = compare_score < 0.3
+    iris_codes_below_default_threshold = compare_codes_score < 0.3
     find_score_below_default_threshold = find_score < 0.3
     mate_found = find_index == 0
-    mate_score_consistent = np.isclose(find_score, compare_score)
 
     passed = bool(
-        identical_zero
-        and identical_centered
-        and genuine_below_default_threshold
+        genuine_below_default_threshold
+        and iris_codes_below_default_threshold
         and find_score_below_default_threshold
+        and mate_found
     )
     return {
         "is_functional_iris_recognizer": "yes" if passed else "no",
         "checks": {
-            "identical_image_score_is_zero": bool(identical_zero),
-            "identical_image_best_offset_is_zero": bool(identical_centered),
             "genuine_image_score_below_default_threshold": bool(genuine_below_default_threshold),
+            "genuine_iris_code_score_below_default_threshold": bool(iris_codes_below_default_threshold),
             "find_score_below_default_threshold": bool(find_score_below_default_threshold),
             "find_returns_enrolled_mate": bool(mate_found),
-            "find_score_matches_compare_image_score": bool(mate_score_consistent),
         },
         "details": {
-            "identical_image_score": identical_score,
-            "identical_image_offset": identical_offset,
             "compare_image_score": compare_score,
+            "compare_iris_codes_score": compare_codes_score,
             "find_index": find_index,
             "find_score": find_score,
         },
@@ -355,18 +316,26 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
     )
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
     codes = build_database(classifier, database_samples)
+    query_code = np.stack(
+        classifier.get_iris_code(query["iris_band"], query["iris_mask"])[:2],
+        axis=0,
+    ).astype(bool)
+    compare_code = np.stack(
+        classifier.get_iris_code(compare_sample["iris_band"], compare_sample["iris_mask"])[:2],
+        axis=0,
+    ).astype(bool)
 
     operations = [
         benchmark("enroll", runs, lambda: enroll_operation(classifier, query)),
         benchmark(
-            "compare_identical_image",
-            runs,
-            lambda: compare_identical_image_operation(classifier, query, rotation),
-        ),
-        benchmark(
             "compare_image",
             runs,
             lambda: compare_image_operation(classifier, query, compare_sample, rotation),
+        ),
+        benchmark(
+            "compare_iris_codes",
+            runs,
+            lambda: compare_iris_codes_operation(query_code, compare_code),
         ),
         benchmark(
             "find",
@@ -401,7 +370,6 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, s
 
     summary = summarize_label_pairs(labels)
     classifier = IrisClassifier(filters)
-    started = time.perf_counter()
     base_codes, base_masks, rotated_codes, rotated_masks, offsets = precompute_codes_with_optional_backend(
         images,
         image_names,
@@ -411,7 +379,6 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, s
     )
     pairwise = compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets)
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
-    elapsed = time.perf_counter() - started
 
     return {
         "dataset_format": dataset_format,
@@ -420,7 +387,6 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, s
         "sample_summary": summary,
         "sampling": config,
         "rotation": int(rotation),
-        "elapsed_seconds": float(elapsed),
         "eer": float(evaluation["eer"]),
         "eer_threshold": float(evaluation["eer_threshold"]),
         "roc_auc": float(evaluation["roc_auc"]),
@@ -450,7 +416,7 @@ def main():
     parser.add_argument(
         "--speed-runs",
         type=int,
-        default=10,
+        default=100,
         help="How many repetitions to use per speed benchmark.",
     )
     parser.add_argument(
@@ -508,7 +474,7 @@ def main():
         "filters_count": int(len(filters)),
         "rotation": int(args.rotation),
         "pairwise": [],
-        "speed": [],
+        "speed": None,
     }
 
     for dataset_format in args.datasets:
@@ -525,21 +491,25 @@ def main():
             results["pairwise"].append(pairwise_result)
             print(
                 f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} "
-                f"EER={pairwise_result['eer']:.4f} "
-                f"time={pairwise_result['elapsed_seconds']:.1f}s"
+                f"EER={pairwise_result['eer']:.4f}"
             )
-        if not args.skip_speed:
-            speed_result = run_speed_benchmark(
-                dataset_path,
-                dataset_format,
-                args.rotation,
-                args.speed_runs,
-                args.database_size,
-                segmentation_backend=args.segmentation_backend,
-            )
-            results["speed"].append(speed_result)
-            print(f"  speed: database_size={speed_result['database_size']} query={speed_result['query_image']}")
         output_path.write_text(json.dumps(format_result(results), indent=2))
+
+    if not args.skip_speed:
+        speed_dataset_path, speed_dataset_format = resolve_dataset(None, args.datasets[0])
+        speed_result = run_speed_benchmark(
+            speed_dataset_path,
+            speed_dataset_format,
+            args.rotation,
+            args.speed_runs,
+            args.database_size,
+            segmentation_backend=args.segmentation_backend,
+        )
+        results["speed"] = speed_result
+        print(
+            f"Speed benchmark dataset: {speed_result['dataset_format']} "
+            f"(database_size={speed_result['database_size']}, query={speed_result['query_image']})"
+        )
 
     output_path.write_text(json.dumps(format_result(results), indent=2))
     print(f"Saved pipeline results to {output_path}")
