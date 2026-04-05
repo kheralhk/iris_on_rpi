@@ -1,5 +1,4 @@
 from argparse import ArgumentParser
-import inspect
 import json
 from pathlib import Path
 import sys
@@ -55,15 +54,6 @@ DEFAULT_PAIRWISE_CONFIGS = {
     },
 }
 
-
-def _supports_kwarg(func, kwarg_name):
-    return kwarg_name in inspect.signature(func).parameters
-
-
-GET_IRIS_BAND_SUPPORTS_BACKEND = _supports_kwarg(get_iris_band, "backend")
-PRECOMPUTE_CODES_SUPPORTS_BACKEND = _supports_kwarg(precompute_codes, "segmentation_backend")
-
-
 def format_result(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -78,38 +68,8 @@ def format_result(value):
     return value
 
 
-def segment_with_optional_backend(image, segmentation_backend=None):
-    if segmentation_backend is None or GET_IRIS_BAND_SUPPORTS_BACKEND:
-        return get_iris_band(image, backend=segmentation_backend) if GET_IRIS_BAND_SUPPORTS_BACKEND else get_iris_band(image)
-    if str(segmentation_backend).strip().lower() != "wahet":
-        raise RuntimeError(
-            f"Segmentation backend '{segmentation_backend}' is not supported by this branch."
-        )
+def segment_image(image):
     return get_iris_band(image)
-
-
-def precompute_codes_with_optional_backend(
-    images,
-    image_names,
-    classifier,
-    rotation,
-    segmentation_backend=None,
-):
-    if segmentation_backend is None or PRECOMPUTE_CODES_SUPPORTS_BACKEND:
-        if PRECOMPUTE_CODES_SUPPORTS_BACKEND:
-            return precompute_codes(
-                images,
-                image_names,
-                classifier,
-                rotation,
-                segmentation_backend=segmentation_backend,
-            )
-        return precompute_codes(images, image_names, classifier, rotation)
-    if str(segmentation_backend).strip().lower() != "wahet":
-        raise RuntimeError(
-            f"Segmentation backend '{segmentation_backend}' is not supported by this branch."
-        )
-    return precompute_codes(images, image_names, classifier, rotation)
 
 
 def benchmark(name, runs, func):
@@ -128,7 +88,7 @@ def benchmark(name, runs, func):
     }
 
 
-def find_speed_benchmark_samples(dataset_path, dataset_format, database_size, segmentation_backend=None):
+def find_speed_benchmark_samples(dataset_path, dataset_format, database_size):
     images, labels, image_names = load_dataset(dataset_path, dataset_format)
     label_to_samples = {}
 
@@ -142,7 +102,7 @@ def find_speed_benchmark_samples(dataset_path, dataset_format, database_size, se
         return False
 
     for image, label, name in zip(images, labels, image_names):
-        iris_band, iris_mask = segment_with_optional_backend(image, segmentation_backend=segmentation_backend)
+        iris_band, iris_mask = segment_image(image)
         if iris_band is None or iris_mask is None:
             continue
         label_to_samples.setdefault(str(label), []).append(
@@ -253,7 +213,12 @@ def find_operation(classifier, sample, codes, rotation):
     best_match = None
     best_score = float("inf")
     for index in range(codes.shape[1]):
-        curr_scores = hamming_distances(iris_codes, codes[0, index], mask_codes, codes[1, index])
+        curr_scores = hamming_distances(
+            iris_codes,
+            codes[0, index],
+            mask_codes,
+            codes[1, index],
+        )
         curr_score = float(np.min(curr_scores))
         if curr_score < best_score:
             best_score = curr_score
@@ -306,13 +271,12 @@ def build_functional_summary(operations):
     }
 
 
-def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size, segmentation_backend=None):
+def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size):
     classifier = IrisClassifier(filters)
     samples = find_speed_benchmark_samples(
         dataset_path,
         dataset_format,
         database_size,
-        segmentation_backend=segmentation_backend,
     )
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
     codes = build_database(classifier, database_samples)
@@ -346,7 +310,7 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
 
     return {
         "dataset_format": dataset_format,
-        "segmentation_backend": segmentation_backend or "wahet",
+        "segmentation_backend": "unet",
         "query_image": query["image_name"],
         "compare_image": compare_sample["image_name"],
         "database_size": int(database_size),
@@ -355,7 +319,7 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
     }
 
 
-def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, segmentation_backend=None):
+def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
     config = DEFAULT_PAIRWISE_CONFIGS[dataset_format]
     images, labels, image_names = load_dataset(dataset_path, dataset_format)
     images, labels, image_names = sample_dataset(
@@ -370,19 +334,18 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, s
 
     summary = summarize_label_pairs(labels)
     classifier = IrisClassifier(filters)
-    base_codes, base_masks, rotated_codes, rotated_masks, offsets = precompute_codes_with_optional_backend(
+    base_codes, base_masks, rotated_codes, rotated_masks, offsets = precompute_codes(
         images,
         image_names,
         classifier,
         rotation,
-        segmentation_backend=segmentation_backend,
     )
     pairwise = compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets)
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
     return {
         "dataset_format": dataset_format,
-        "segmentation_backend": segmentation_backend or "wahet",
+        "segmentation_backend": "unet",
         "dataset_path": str(dataset_path),
         "sample_summary": summary,
         "sampling": config,
@@ -416,7 +379,7 @@ def main():
     parser.add_argument(
         "--speed-runs",
         type=int,
-        default=100,
+        default=300,
         help="How many repetitions to use per speed benchmark.",
     )
     parser.add_argument(
@@ -444,11 +407,6 @@ def main():
         "--output-name",
         default="benchmark_results.json",
         help="Filename for the JSON results inside --output-dir, or an absolute JSON path.",
-    )
-    parser.add_argument(
-        "--segmentation-backend",
-        default=None,
-        help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
     )
     args = parser.parse_args()
 
@@ -486,7 +444,6 @@ def main():
                 dataset_format,
                 args.rotation,
                 output_dir,
-                segmentation_backend=args.segmentation_backend,
             )
             results["pairwise"].append(pairwise_result)
             print(
@@ -503,7 +460,6 @@ def main():
             args.rotation,
             args.speed_runs,
             args.database_size,
-            segmentation_backend=args.segmentation_backend,
         )
         results["speed"] = speed_result
         print(

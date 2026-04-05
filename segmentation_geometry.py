@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -6,6 +7,8 @@ import numpy as np
 
 
 DEFAULT_BAND_SHAPE = (64, 512)
+DEFAULT_INVALID_DILATION_KERNEL = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_KERNEL", 1)))
+DEFAULT_INVALID_DILATION_ITERATIONS = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_ITERATIONS", 1)))
 
 
 @dataclass(frozen=True)
@@ -187,15 +190,45 @@ def fit_polar_boundary_from_mask(
     return PolarBoundary(center_x=float(center_x), center_y=float(center_y), radii=smoothed)
 
 
-def build_valid_source_mask(iris_mask, pupil_mask, occlusion_mask=None, source_image=None, oversat_threshold=254):
+def dilate_invalid_region(valid_mask, support_mask, kernel_size=DEFAULT_INVALID_DILATION_KERNEL, iterations=DEFAULT_INVALID_DILATION_ITERATIONS):
+    kernel_size = max(int(kernel_size), 1)
+    iterations = max(int(iterations), 1)
+    valid_bool = np.asarray(valid_mask) > 0
+    support_bool = np.asarray(support_mask) > 0
+    invalid_inside_support = support_bool & ~valid_bool
+    if not np.any(invalid_inside_support):
+        return (valid_bool.astype(np.uint8) * 255)
+
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    dilated_invalid = cv.dilate(invalid_inside_support.astype(np.uint8), kernel, iterations=iterations) > 0
+    dilated_invalid &= support_bool
+    dilated_valid = support_bool & ~dilated_invalid
+    return (dilated_valid.astype(np.uint8) * 255)
+
+
+def build_valid_source_mask(
+    iris_mask,
+    pupil_mask,
+    occlusion_mask=None,
+    source_image=None,
+    oversat_threshold=254,
+    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
+    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
+):
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
-    valid = iris_mask.astype(bool) & ~pupil_mask.astype(bool)
+    annulus_mask = iris_mask.astype(bool) & ~pupil_mask.astype(bool)
+    valid = annulus_mask.copy()
     if occlusion_mask is not None:
         valid &= ~(np.asarray(occlusion_mask) > 0)
     if source_image is not None:
         valid &= np.asarray(source_image) < oversat_threshold
-    return (valid.astype(np.uint8) * 255)
+    return dilate_invalid_region(
+        valid.astype(np.uint8) * 255,
+        annulus_mask.astype(np.uint8) * 255,
+        kernel_size=invalid_dilation_kernel,
+        iterations=invalid_dilation_iterations,
+    )
 
 
 def normalize_iris_from_boundaries(
@@ -236,7 +269,6 @@ def normalize_iris_from_boundaries(
 
     return np.clip(band, 0, 255).astype(np.uint8), (sampled_mask > 0).astype(np.uint8) * 255
 
-
 def semantic_masks_to_band(
     image,
     iris_mask,
@@ -244,6 +276,8 @@ def semantic_masks_to_band(
     occlusion_mask=None,
     band_shape=DEFAULT_BAND_SHAPE,
     prefer_ellipse=True,
+    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
+    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
 ):
     if occlusion_mask is not None:
         occlusion_mask = clean_component_mask(occlusion_mask, kernel_size=3)
@@ -259,6 +293,8 @@ def semantic_masks_to_band(
         occlusion_mask,
         source_image=image,
         oversat_threshold=254,
+        invalid_dilation_kernel=invalid_dilation_kernel,
+        invalid_dilation_iterations=invalid_dilation_iterations,
     )
     pupil_ellipse = fit_boundary_from_mask(pupil_mask, prefer_ellipse=prefer_ellipse)
     center = (pupil_ellipse.center_x, pupil_ellipse.center_y)

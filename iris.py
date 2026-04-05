@@ -3,16 +3,11 @@
 import cv2 as cv
 import numpy as np
 import os
-import subprocess
-import tempfile
-from profiling import timeit, span
+from profiling import timeit
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
 from segmentation_geometry import semantic_masks_to_band, DEFAULT_BAND_SHAPE
-tmp = Path(tempfile.gettempdir())
-WAHET_BINARY = Path(__file__).resolve().parent / "wahet"
-PATCH_VALID_COVERAGE = 0.1
-DEFAULT_SEGMENTATION_BACKEND = os.environ.get("IRIS_SEGMENTATION_BACKEND", "wahet").strip().lower()
+DEFAULT_SEGMENTATION_BACKEND = "unet"
 UNET_ONNX_PATH = Path(
     os.environ.get(
         "IRIS_UNET_ONNX_PATH",
@@ -44,9 +39,9 @@ def hamming_distance(a,b,mask1, mask2):
 def hamming_distances(a, b, masks_a, mask_b):
     diff = np.bitwise_xor(a, b)
     mask = np.bitwise_and(masks_a, mask_b)
+    scores = np.full(a.shape[0], 2.0, dtype=np.float64)
     total = np.sum(np.bitwise_and(diff, mask), axis=1)
     n = np.sum(mask, axis=1)
-    scores = np.full(a.shape[0], 2.0, dtype=np.float64)
     valid = n > 0
     scores[valid] = total[valid] / n[valid]
     return scores
@@ -151,20 +146,8 @@ def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_posit
     mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
     sampled_mask_rows = mask_windows[y_positions + extra_top]
     sampled_mask = sampled_mask_rows[:, x_positions, :, :]
-    mask_coverage = np.mean(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
-    mask_bits = mask_coverage >= PATCH_VALID_COVERAGE
+    mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
     return results, mask_bits
-
-@timeit
-def _segment_with_wahet(img):
-    cv.imwrite(tmp/"input.png", img)
-    with span("wahet"):
-        subprocess.run([str(WAHET_BINARY), "-i", tmp/"input.png", "-o", tmp/"output.png", "-m", tmp/"mask.png"], capture_output=True
-        )
-    image = cv.imread(tmp/"output.png", cv.IMREAD_GRAYSCALE)
-    mask = cv.imread(tmp/"mask.png", cv.IMREAD_GRAYSCALE)
-    return image, mask
-
 
 def _resolve_dnn_backend(name):
     mapping = {
@@ -260,13 +243,8 @@ def _segment_with_unet(img):
 
 
 @timeit
-def get_iris_band(img, backend=None):
-    backend_name = (backend or DEFAULT_SEGMENTATION_BACKEND).strip().lower()
-    if backend_name == "wahet":
-        return _segment_with_wahet(img)
-    if backend_name == "unet":
-        return _segment_with_unet(img)
-    raise ValueError(f"Unsupported segmentation backend: {backend_name}")
+def get_iris_band(img):
+    return _segment_with_unet(img)
 
 class IrisClassifier():
     def __init__(self, filters) -> None:

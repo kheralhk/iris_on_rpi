@@ -1,10 +1,6 @@
 # mask_occlusion_tests.py
 
 from argparse import ArgumentParser
-from itertools import combinations
-import csv
-import inspect
-import json
 from pathlib import Path
 import random
 import sys
@@ -13,12 +9,6 @@ import cv2 as cv
 import matplotlib.pyplot as plt
 import numpy as np
 
-try:
-    from sklearn.metrics import auc, roc_curve
-except ImportError:  # pragma: no cover - optional dependency
-    auc = None
-    roc_curve = None
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,13 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset_loaders import load_dataset, resolve_dataset
 from filters import filters
-import iris as iris_module
-
-IrisClassifier = iris_module.IrisClassifier
-get_iris_band = iris_module.get_iris_band
-hamming_distances = iris_module.hamming_distances
-DEFAULT_SEGMENTATION_BACKEND = getattr(iris_module, "DEFAULT_SEGMENTATION_BACKEND", "wahet")
-predict_unet_masks = getattr(iris_module, "predict_unet_masks", None)
+from iris import IrisClassifier, get_iris_band, hamming_distances, predict_unet_masks
 
 try:
     from segmentation_geometry import build_valid_source_mask, clean_component_mask
@@ -42,7 +26,6 @@ except ImportError:
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "mask_occlusion_tests"
-GET_IRIS_BAND_SUPPORTS_BACKEND = "backend" in inspect.signature(get_iris_band).parameters
 
 
 def load_image(path):
@@ -53,28 +36,16 @@ def load_image(path):
     return image_path, image
 
 
-def resolve_backend(name):
-    return (name or DEFAULT_SEGMENTATION_BACKEND).strip().lower()
-
-
-def segment_with_optional_backend(image, backend=None):
-    if backend is None or GET_IRIS_BAND_SUPPORTS_BACKEND:
-        return get_iris_band(image, backend=backend) if GET_IRIS_BAND_SUPPORTS_BACKEND else get_iris_band(image)
-    if str(backend).strip().lower() != "wahet":
-        raise RuntimeError(f"Segmentation backend '{backend}' is not supported by this branch.")
-    return get_iris_band(image)
-
-
-def segment_image(image, backend=None):
-    iris_band, iris_mask = segment_with_optional_backend(image, backend=backend)
+def segment_image(image):
+    iris_band, iris_mask = get_iris_band(image)
     if iris_band is None or iris_mask is None:
         raise RuntimeError("Iris segmentation failed.")
     return iris_band, iris_mask
 
 
 def get_unet_source_debug(image):
-    if predict_unet_masks is None or build_valid_source_mask is None or clean_component_mask is None:
-        raise RuntimeError("U-Net source overlays require the unet-segmentation branch/runtime.")
+    if build_valid_source_mask is None or clean_component_mask is None:
+        raise RuntimeError("Source overlays require segmentation geometry helpers.")
     gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
@@ -101,8 +72,11 @@ def get_unet_source_debug(image):
         "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
         "excluded": excluded.astype(np.uint8) * 255,
         "valid": valid.astype(np.uint8) * 255,
+        "base_title": "Original Eye Image",
+        "overlay_title": "Source Mask Overlay",
+        "valid_title": "Valid Iris Area",
+        "excluded_title": "Excluded Iris Area",
     }
-
 
 def sample_dataset(
     images,
@@ -217,87 +191,16 @@ def symmetric_compare_with_details(classifier, iris1, mask1, iris2, mask2, rotat
     return result
 
 
-def evaluate_scores(same_class, scores):
-    if roc_curve is None or auc is None:
-        return {}
-    if np.sum(same_class) == 0 or np.sum(~same_class) == 0:
-        return {}
-
-    fpr, tpr, thresholds = roc_curve(same_class, -scores)
-    fnr = 1.0 - tpr
-    eer_index = int(np.nanargmin(np.abs(fnr - fpr)))
-    return {
-        "roc_auc": float(auc(fpr, tpr)),
-        "eer": float((fpr[eer_index] + fnr[eer_index]) / 2.0),
-        "eer_threshold": float(thresholds[eer_index]),
-    }
-
-
-def summarize_rows(rows):
-    same_class = np.array([row["same_class"] for row in rows], dtype=bool)
-    scores = np.array([row["score"] for row in rows], dtype=np.float64)
-    valid_bits = np.array([row["valid_bits"] for row in rows], dtype=np.int32)
-    valid_fraction = np.array([row["valid_fraction"] for row in rows], dtype=np.float64)
-
-    summary = {
-        "pair_count": int(len(rows)),
-        "genuine_count": int(np.sum(same_class)),
-        "impostor_count": int(np.sum(~same_class)),
-    }
-
-    if np.any(same_class):
-        summary.update(
-            {
-                "genuine_score_mean": float(np.mean(scores[same_class])),
-                "genuine_score_std": float(np.std(scores[same_class])),
-                "genuine_valid_bits_mean": float(np.mean(valid_bits[same_class])),
-                "genuine_valid_fraction_mean": float(np.mean(valid_fraction[same_class])),
-            }
-        )
-
-    if np.any(~same_class):
-        summary.update(
-            {
-                "impostor_score_mean": float(np.mean(scores[~same_class])),
-                "impostor_score_std": float(np.std(scores[~same_class])),
-                "impostor_valid_bits_mean": float(np.mean(valid_bits[~same_class])),
-                "impostor_valid_fraction_mean": float(np.mean(valid_fraction[~same_class])),
-            }
-        )
-
-    if np.any(same_class) and np.any(~same_class):
-        summary["score_gap"] = float(np.mean(scores[~same_class]) - np.mean(scores[same_class]))
-        summary.update(evaluate_scores(same_class, scores))
-
-    return summary
-
-
-def build_mask_overlay(iris_band, original_mask, enlarged_mask):
-    base = cv.cvtColor(iris_band, cv.COLOR_GRAY2RGB).astype(np.float32)
-    original_invalid = original_mask != 255
-    enlarged_invalid = enlarged_mask != 255
-    newly_masked = enlarged_invalid & ~original_invalid
-
-    overlay = base.copy()
-    overlay[original_invalid] = 0.2 * overlay[original_invalid] + 0.8 * np.array([255, 0, 0], dtype=np.float32)
-    overlay[newly_masked] = 0.2 * overlay[newly_masked] + 0.8 * np.array([255, 255, 0], dtype=np.float32)
-
-    original_contours, _ = cv.findContours(original_invalid.astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    enlarged_contours, _ = cv.findContours(enlarged_invalid.astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    cv.drawContours(overlay, original_contours, -1, (255, 0, 0), 2)
-    cv.drawContours(overlay, enlarged_contours, -1, (255, 255, 0), 2)
-    return np.clip(overlay, 0, 255).astype(np.uint8)
-
-
 def build_source_mask_overlay(source_debug):
     gray = source_debug["gray"]
     annulus = source_debug["annulus"] > 0
     excluded = source_debug["excluded"] > 0
     pupil = source_debug["pupil"] > 0
+    excluded_color = np.array([170, 90, 220], dtype=np.float32)
 
     overlay = cv.cvtColor(gray, cv.COLOR_GRAY2RGB).astype(np.float32)
     overlay[annulus] = 0.4 * overlay[annulus] + 0.6 * np.array([0, 255, 0], dtype=np.float32)
-    overlay[excluded] = 0.2 * overlay[excluded] + 0.8 * np.array([110, 40, 150], dtype=np.float32)
+    overlay[excluded] = 0.55 * overlay[excluded] + 0.45 * excluded_color
     overlay[pupil] = 0.15 * overlay[pupil]
 
     annulus_contours, _ = cv.findContours(annulus.astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
@@ -305,7 +208,7 @@ def build_source_mask_overlay(source_debug):
     pupil_contours, _ = cv.findContours(pupil.astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
     cv.drawContours(overlay, annulus_contours, -1, (0, 255, 0), 2)
-    cv.drawContours(overlay, excluded_contours, -1, (110, 40, 150), 2)
+    cv.drawContours(overlay, excluded_contours, -1, tuple(int(v) for v in excluded_color), 2)
     cv.drawContours(overlay, pupil_contours, -1, (0, 0, 0), 2)
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
@@ -316,23 +219,23 @@ def save_source_overlay_preview(output_path, source_debug):
     axes = axes.ravel()
 
     axes[0].imshow(source_debug["gray"], cmap="gray")
-    axes[0].set_title("Original Eye Image")
+    axes[0].set_title(source_debug.get("base_title", "Original Eye Image"))
     axes[0].axis("off")
 
     axes[1].imshow(overlay)
-    axes[1].set_title("Source Mask Overlay")
+    axes[1].set_title(source_debug.get("overlay_title", "Mask Overlay"))
     axes[1].axis("off")
 
     axes[2].imshow(source_debug["valid"], cmap="gray", vmin=0, vmax=255)
-    axes[2].set_title("Valid Iris Area")
+    axes[2].set_title(source_debug.get("valid_title", "Valid Area"))
     axes[2].axis("off")
 
     axes[3].imshow(source_debug["excluded"], cmap="gray", vmin=0, vmax=255)
-    axes[3].set_title("Excluded Iris Area")
+    axes[3].set_title(source_debug.get("excluded_title", "Excluded Area"))
     axes[3].axis("off")
 
     figure.suptitle(
-        "Overlay colors: green = iris annulus, purple = excluded inside annulus, black = pupil",
+        "Overlay colors: green = valid segmentation, purple = excluded area, black = pupil (if available)",
         fontsize=12,
     )
     figure.tight_layout()
@@ -341,61 +244,15 @@ def save_source_overlay_preview(output_path, source_debug):
     plt.close(figure)
 
 
-def save_band_overlay_preview(output_path, raw_image, iris_band, original_mask, enlarged_mask):
-    original_overlay = build_mask_overlay(iris_band, original_mask, original_mask)
-    enlarged_overlay = build_mask_overlay(iris_band, original_mask, enlarged_mask)
-    newly_masked = ((original_mask == 255) & (enlarged_mask != 255)).astype(np.uint8) * 255
-
-    figure, axes = plt.subplots(2, 3, figsize=(14, 8))
-    axes = axes.ravel()
-
-    axes[0].imshow(raw_image, cmap="gray")
-    axes[0].set_title("Original Eye Image")
-    axes[0].axis("off")
-
-    axes[1].imshow(original_overlay)
-    axes[1].set_title("Original Band Mask Overlay")
-    axes[1].axis("off")
-
-    axes[2].imshow(enlarged_overlay)
-    axes[2].set_title("Enlarged Band Mask Overlay")
-    axes[2].axis("off")
-
-    axes[3].imshow(iris_band, cmap="gray")
-    axes[3].set_title("Original Unwrapped Iris Band")
-    axes[3].axis("off")
-
-    axes[4].imshow(original_mask, cmap="gray", vmin=0, vmax=255)
-    axes[4].set_title("Original Mask (Band Coordinates)")
-    axes[4].axis("off")
-
-    axes[5].imshow(newly_masked, cmap="gray", vmin=0, vmax=255)
-    axes[5].set_title("Newly Masked Area")
-    axes[5].axis("off")
-
-    figure.suptitle(
-        "Band overlay colors: red = originally invalid, yellow = newly masked after enlargement",
-        fontsize=12,
-    )
-    figure.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
-
-
-def write_csv(output_path, rows):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations):
+    source_debug = get_unet_source_debug(raw_image)
+    save_source_overlay_preview(output_path, source_debug)
 
 
 def run_single(args):
     classifier = IrisClassifier(filters)
     image_path, image = load_image(args.image)
-    backend = resolve_backend(args.segmentation_backend)
-    iris_band, iris_mask = segment_image(image, backend=backend)
+    iris_band, iris_mask = segment_image(image)
 
     enlarged_mask = build_enlarged_mask(iris_mask, args.kernel_size, args.iterations)
     occluded_iris = apply_synthetic_occlusion(
@@ -438,43 +295,27 @@ def run_single(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = image_path.stem
 
-    overlay_path = output_dir / f"{stem}_mask_occlusion_overlay.png"
-    if backend == "unet":
-        source_debug = get_unet_source_debug(image)
-        save_source_overlay_preview(overlay_path, source_debug)
-    else:
-        save_band_overlay_preview(overlay_path, image, iris_band, iris_mask, enlarged_mask)
+    overlay_path = output_dir / f"{stem}_{args.output_label}.png"
+    save_overlay_preview(overlay_path, image, iris_band, iris_mask, args.kernel_size, args.iterations)
 
-    result = {
-        "metadata": {
-            "image_path": str(image_path),
-            "segmentation_backend": backend,
-            "rotation": args.rotation,
-            "kernel_size": args.kernel_size,
-            "iterations": args.iterations,
-            "fill_mode": args.fill_mode,
-            "original_valid_fraction": original_valid_fraction,
-            "enlarged_valid_fraction": enlarged_valid_fraction,
-            "newly_masked_pixels": newly_masked_pixels,
-        },
-        "baseline_original_vs_original": baseline,
-        "test_1_mask_only": mask_only,
-        "test_2_mask_and_occlusion": occluded,
-        "overlay_preview_path": str(overlay_path),
-    }
-
-    output_path = output_dir / f"{stem}_mask_occlusion_single.json"
-    output_path.write_text(json.dumps(result, indent=2))
-
-    print(json.dumps(result, indent=2))
-    print(f"Saved single-image analysis to: {output_path}")
+    print(f"Image: {image_path}")
+    print("Backend: unet")
+    print(f"Original valid fraction: {original_valid_fraction:.4f}")
+    print(f"Enlarged valid fraction: {enlarged_valid_fraction:.4f}")
+    print(f"Newly masked pixels: {newly_masked_pixels}")
+    print(
+        "Baseline score / mask-only score / mask+occlusion score: "
+        f"{baseline['score']:.6f} / {mask_only['score']:.6f} / {occluded['score']:.6f}"
+    )
+    print(
+        "Fill mode options: zero=fill with black (0), white=fill with white (255), "
+        "mean=fill with the mean valid iris intensity."
+    )
     print(f"Saved overlay preview to: {overlay_path}")
 
 
-def run_control(args):
-    classifier = IrisClassifier(filters)
+def run_multiple(args):
     dataset_path, dataset_format = resolve_dataset(args.dataset_path, args.dataset_format)
-    backend = resolve_backend(args.segmentation_backend)
     images, labels, image_names = load_dataset(dataset_path, dataset_format)
     images, labels, image_names = sample_dataset(
         images,
@@ -486,151 +327,43 @@ def run_control(args):
         seed=args.seed,
     )
 
-    segmented = []
     skipped = []
+    saved = 0
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for index, image in enumerate(images, start=1):
         if index == 1 or index % 10 == 0 or index == len(images):
             print(f"Segmenting samples: {index}/{len(images)}")
-        iris_band, iris_mask = segment_with_optional_backend(image, backend=backend)
+        iris_band, iris_mask = get_iris_band(image)
         if iris_band is None or iris_mask is None:
             skipped.append(str(image_names[index - 1]))
             continue
 
-        enlarged_mask = build_enlarged_mask(iris_mask, args.kernel_size, args.iterations)
-        occluded_iris = apply_synthetic_occlusion(
-            iris_band,
-            iris_mask,
-            enlarged_mask,
-            args.fill_mode,
-        )
-        segmented.append(
-            {
-                "name": str(image_names[index - 1]),
-                "label": str(labels[index - 1]),
-                "iris_band": iris_band,
-                "iris_mask": iris_mask,
-                "enlarged_mask": enlarged_mask,
-                "occluded_iris": occluded_iris,
-            }
-        )
+        name = Path(str(image_names[index - 1])).stem
+        overlay_path = output_dir / f"{name}_{args.output_label}.png"
+        save_overlay_preview(overlay_path, image, iris_band, iris_mask, args.kernel_size, args.iterations)
+        saved += 1
 
-    if len(segmented) < 2:
-        raise RuntimeError("Need at least two segmented samples for the control test.")
-
-    baseline_rows = []
-    mask_only_rows = []
-    occluded_rows = []
-    pair_count = len(segmented) * (len(segmented) - 1) // 2
-
-    for pair_index, (idx1, idx2) in enumerate(combinations(range(len(segmented)), 2), start=1):
-        sample1 = segmented[idx1]
-        sample2 = segmented[idx2]
-        same_class = sample1["label"] == sample2["label"]
-
-        baseline = symmetric_compare_with_details(
-            classifier,
-            sample1["iris_band"],
-            sample1["iris_mask"],
-            sample2["iris_band"],
-            sample2["iris_mask"],
-            args.rotation,
-        )
-        mask_only = symmetric_compare_with_details(
-            classifier,
-            sample1["iris_band"],
-            sample1["iris_mask"],
-            sample2["iris_band"],
-            sample2["enlarged_mask"],
-            args.rotation,
-        )
-        occluded = symmetric_compare_with_details(
-            classifier,
-            sample1["iris_band"],
-            sample1["iris_mask"],
-            sample2["occluded_iris"],
-            sample2["enlarged_mask"],
-            args.rotation,
-        )
-
-        pair_meta = {
-            "same_class": bool(same_class),
-            "label_1": sample1["label"],
-            "label_2": sample2["label"],
-            "image_1": sample1["name"],
-            "image_2": sample2["name"],
-        }
-
-        baseline_rows.append({**pair_meta, **baseline})
-        mask_only_rows.append({**pair_meta, **mask_only})
-        occluded_rows.append({**pair_meta, **occluded})
-
-        if pair_index == 1 or pair_index % 100 == 0 or pair_index == pair_count:
-            print(f"Scored pairs: {pair_index}/{pair_count}")
-
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_slug = dataset_format.replace("-", "")
-    base_name = (
-        f"mask_occlusion_control_{dataset_slug}_ids"
-        f"{args.max_identities if args.max_identities is not None else 'all'}_img"
-        f"{args.max_images_per_identity if args.max_images_per_identity is not None else 'all'}_seed{args.seed}"
-    )
-
-    baseline_summary = summarize_rows(baseline_rows)
-    mask_only_summary = summarize_rows(mask_only_rows)
-    occluded_summary = summarize_rows(occluded_rows)
-
-    result = {
-        "metadata": {
-            "dataset_format": dataset_format,
-            "dataset_path": str(dataset_path),
-            "rotation": args.rotation,
-            "segmentation_backend": backend,
-            "kernel_size": args.kernel_size,
-            "iterations": args.iterations,
-            "fill_mode": args.fill_mode,
-            "seed": args.seed,
-            "max_samples": args.max_samples,
-            "max_identities": args.max_identities,
-            "max_images_per_identity": args.max_images_per_identity,
-            "segmented_sample_count": len(segmented),
-            "skipped_samples": skipped,
-        },
-        "baseline_original_vs_original": baseline_summary,
-        "control_mask_only": mask_only_summary,
-        "control_mask_and_occlusion": occluded_summary,
-    }
-
-    json_path = output_dir / f"{base_name}.json"
-    json_path.write_text(json.dumps(result, indent=2))
-
-    if args.save_pairs:
-        write_csv(output_dir / f"{base_name}_baseline.csv", baseline_rows)
-        write_csv(output_dir / f"{base_name}_mask_only.csv", mask_only_rows)
-        write_csv(output_dir / f"{base_name}_mask_and_occlusion.csv", occluded_rows)
-
-    print(json.dumps(result, indent=2))
-    print(f"Saved control-test summary to: {json_path}")
+    print(f"Saved overlay previews: {saved}")
+    if skipped:
+        print(f"Skipped samples: {len(skipped)}")
+        for name in skipped[:10]:
+            print(f"  - {name}")
 
 
 def build_parser():
     parser = ArgumentParser(
         description=(
             "Run mask-occlusion robustness tests for iris recognition. "
-            "Includes single-image mask-only and mask+occlusion tests, plus a dataset control test."
+            "Includes a single-image mask/occlusion test and a multiple-image overlay export."
         )
     )
     parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
-        help="Directory for JSON/CSV/image outputs.",
+        help="Directory for image outputs.",
     )
-    parser.add_argument(
-        "--segmentation-backend",
-        default=None,
-        help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
-    )
-
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     single = subparsers.add_parser(
@@ -642,61 +375,49 @@ def build_parser():
     single.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
     single.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     single.add_argument(
+        "--output-label",
+        default="mask_occlusion_overlay",
+        help="Filename label after the image stem, for example 'source_mask' -> S1129R05_source_mask.png.",
+    )
+    single.add_argument(
         "--fill-mode",
         choices=["zero", "white", "mean"],
         default="zero",
-        help="How to overwrite newly masked pixels for test 2.",
-    )
-    single.add_argument(
-        "--segmentation-backend",
-        default=None,
-        help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
+        help="How to overwrite newly masked pixels for test 2: zero=0, white=255, mean=mean valid intensity.",
     )
     single.set_defaults(func=run_single)
 
-    control = subparsers.add_parser(
-        "control",
-        help="Run the dataset-level control test on genuine and impostor pairs.",
+    multiple = subparsers.add_parser(
+        "multiple",
+        help="Save a mask overlay image for each sampled dataset image.",
     )
-    control.add_argument(
+    multiple.add_argument(
         "--dataset-path",
         help="Path to the dataset directory. If omitted, a known default path is used.",
     )
-    control.add_argument(
+    multiple.add_argument(
         "--dataset-format",
         default="casia-v3-interval",
         choices=["auto", "casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
         help="Dataset folder layout to load.",
     )
-    control.add_argument("--rotation", type=int, default=21, help="Number of offsets to evaluate.")
-    control.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
-    control.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
-    control.add_argument(
-        "--fill-mode",
-        choices=["zero", "white", "mean"],
-        default="zero",
-        help="How to overwrite newly masked pixels for the occlusion test.",
-    )
-    control.add_argument("--max-samples", type=int, default=None, help="Optional cap on total sampled images.")
-    control.add_argument("--max-identities", type=int, default=20, help="Optional cap on sampled identities.")
-    control.add_argument(
+    multiple.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
+    multiple.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
+    multiple.add_argument("--max-samples", type=int, default=None, help="Optional cap on total sampled images.")
+    multiple.add_argument("--max-identities", type=int, default=10, help="Optional cap on sampled identities.")
+    multiple.add_argument(
         "--max-images-per-identity",
         type=int,
-        default=2,
+        default=1,
         help="Optional cap on sampled images per identity.",
     )
-    control.add_argument("--seed", type=int, default=0, help="Random seed for deterministic sampling.")
-    control.add_argument(
-        "--save-pairs",
-        action="store_true",
-        help="Also save per-pair CSV files in addition to the summary JSON.",
+    multiple.add_argument("--seed", type=int, default=0, help="Random seed for deterministic sampling.")
+    multiple.add_argument(
+        "--output-label",
+        default="mask_occlusion_overlay",
+        help="Filename label after each image stem, for example 'source_mask' -> S1129R05_source_mask.png.",
     )
-    control.add_argument(
-        "--segmentation-backend",
-        default=None,
-        help="Optional segmentation backend override, for example 'wahet' or 'unet'.",
-    )
-    control.set_defaults(func=run_control)
+    multiple.set_defaults(func=run_multiple)
 
     return parser
 

@@ -19,9 +19,11 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Compile wahet from [here](https://github.com/ngoclamvt123/usit-v2.2.0).
+3. Ensure the pretrained U-Net segmentation model exists at:
 
-4. Put the wahet executable into your path variable or in the current directory.
+```bash
+models/iris_semseg_upp_scse_mobilenetv2.onnx
+```
 
 ## Usage
 
