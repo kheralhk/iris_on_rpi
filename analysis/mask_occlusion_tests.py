@@ -152,6 +152,7 @@ def compare_with_details(classifier, iris_ref, mask_ref, iris_probe, mask_probe,
     ref_code, ref_code_mask, _ = classifier.get_iris_code(iris_ref, mask_ref)
     ref_code = np.asarray(ref_code, dtype=bool)
     ref_code_mask = np.asarray(ref_code_mask, dtype=bool)
+    bit_weights = classifier.get_bit_weights(iris_ref.shape)
 
     if rotation is None or rotation <= 1:
         offsets = np.array([0], dtype=np.int64)
@@ -163,7 +164,7 @@ def compare_with_details(classifier, iris_ref, mask_ref, iris_probe, mask_probe,
     probe_codes = np.asarray(probe_codes, dtype=bool)
     probe_masks = np.asarray(probe_masks, dtype=bool)
 
-    scores = hamming_distances(probe_codes, ref_code, probe_masks, ref_code_mask)
+    scores = hamming_distances(probe_codes, ref_code, probe_masks, ref_code_mask, weights=bit_weights)
     overlap = np.sum(np.bitwise_and(probe_masks, ref_code_mask), axis=1)
 
     best_index = int(np.argmin(scores))

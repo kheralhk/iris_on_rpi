@@ -54,6 +54,7 @@ DEFAULT_PAIRWISE_CONFIGS = {
     },
 }
 
+
 def format_result(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -210,6 +211,7 @@ def find_operation(classifier, sample, codes, rotation):
         sample["iris_mask"],
         offsets=offsets,
     )
+    bit_weights = classifier.get_bit_weights(sample["iris_band"].shape)
     best_match = None
     best_score = float("inf")
     for index in range(codes.shape[1]):
@@ -218,6 +220,7 @@ def find_operation(classifier, sample, codes, rotation):
             codes[0, index],
             mask_codes,
             codes[1, index],
+            weights=bit_weights,
         )
         curr_score = float(np.min(curr_scores))
         if curr_score < best_score:
@@ -227,11 +230,13 @@ def find_operation(classifier, sample, codes, rotation):
 
 
 def compare_iris_codes_operation(query_code, compare_code):
+    bit_weights = query_code[2]
     score = hamming_distances(
         query_code[0][None, :],
         compare_code[0],
         query_code[1][None, :],
         compare_code[1],
+        weights=bit_weights,
     )[0]
     return float(score)
 
@@ -239,18 +244,18 @@ def compare_iris_codes_operation(query_code, compare_code):
 def build_functional_summary(operations):
     operation_lookup = {item["name"]: item for item in operations}
     compare_score = float(operation_lookup["compare_image"]["last_result"][0])
-    compare_codes_score = float(operation_lookup["compare_iris_codes"]["last_result"])
+    compare_iris_codes_score = float(operation_lookup["compare_iris_codes"]["last_result"])
     find_index = int(operation_lookup["find"]["last_result"][0])
     find_score = float(operation_lookup["find"]["last_result"][1])
 
     genuine_below_default_threshold = compare_score < 0.3
-    iris_codes_below_default_threshold = compare_codes_score < 0.3
+    iris_code_score_below_default_threshold = compare_iris_codes_score < 0.3
     find_score_below_default_threshold = find_score < 0.3
     mate_found = find_index == 0
 
     passed = bool(
         genuine_below_default_threshold
-        and iris_codes_below_default_threshold
+        and iris_code_score_below_default_threshold
         and find_score_below_default_threshold
         and mate_found
     )
@@ -258,13 +263,13 @@ def build_functional_summary(operations):
         "is_functional_iris_recognizer": "yes" if passed else "no",
         "checks": {
             "genuine_image_score_below_default_threshold": bool(genuine_below_default_threshold),
-            "genuine_iris_code_score_below_default_threshold": bool(iris_codes_below_default_threshold),
+            "genuine_iris_code_score_below_default_threshold": bool(iris_code_score_below_default_threshold),
             "find_score_below_default_threshold": bool(find_score_below_default_threshold),
             "find_returns_enrolled_mate": bool(mate_found),
         },
         "details": {
             "compare_image_score": compare_score,
-            "compare_iris_codes_score": compare_codes_score,
+            "compare_iris_codes_score": compare_iris_codes_score,
             "find_index": find_index,
             "find_score": find_score,
         },
@@ -273,11 +278,7 @@ def build_functional_summary(operations):
 
 def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size):
     classifier = IrisClassifier(filters)
-    samples = find_speed_benchmark_samples(
-        dataset_path,
-        dataset_format,
-        database_size,
-    )
+    samples = find_speed_benchmark_samples(dataset_path, dataset_format, database_size)
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
     codes = build_database(classifier, database_samples)
     query_code = np.stack(
@@ -288,28 +289,22 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
         classifier.get_iris_code(compare_sample["iris_band"], compare_sample["iris_mask"])[:2],
         axis=0,
     ).astype(bool)
+    bit_weights = classifier.get_bit_weights(query["iris_band"].shape)
 
     operations = [
         benchmark("enroll", runs, lambda: enroll_operation(classifier, query)),
-        benchmark(
-            "compare_image",
-            runs,
-            lambda: compare_image_operation(classifier, query, compare_sample, rotation),
-        ),
+        benchmark("compare_image", runs, lambda: compare_image_operation(classifier, query, compare_sample, rotation)),
         benchmark(
             "compare_iris_codes",
             runs,
-            lambda: compare_iris_codes_operation(query_code, compare_code),
+            lambda: compare_iris_codes_operation((query_code[0], query_code[1], bit_weights), compare_code),
         ),
-        benchmark(
-            "find",
-            runs,
-            lambda: find_operation(classifier, query, codes, rotation),
-        ),
+        benchmark("find", runs, lambda: find_operation(classifier, query, codes, rotation)),
     ]
 
     return {
         "dataset_format": dataset_format,
+        "feature_extractor": "gabor_radial_weighted",
         "segmentation_backend": "unet",
         "query_image": query["image_name"],
         "compare_image": compare_sample["image_name"],
@@ -334,17 +329,26 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
 
     summary = summarize_label_pairs(labels)
     classifier = IrisClassifier(filters)
-    base_codes, base_masks, rotated_codes, rotated_masks, offsets = precompute_codes(
+    base_codes, base_masks, rotated_codes, rotated_masks, offsets, bit_weights = precompute_codes(
         images,
         image_names,
         classifier,
         rotation,
     )
-    pairwise = compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets)
+    pairwise = compute_pairwise_scores(
+        labels,
+        base_codes,
+        base_masks,
+        rotated_codes,
+        rotated_masks,
+        offsets,
+        bit_weights=bit_weights,
+    )
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
     return {
         "dataset_format": dataset_format,
+        "feature_extractor": "gabor_radial_weighted",
         "segmentation_backend": "unet",
         "dataset_path": str(dataset_path),
         "sample_summary": summary,
@@ -359,8 +363,8 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
 def main():
     parser = ArgumentParser(
         description=(
-            "Evaluate an iris pipeline for pairwise discrimination and key recognition operations "
-            "so different segmentation or matching variants can be compared consistently."
+            "Evaluate the U-Net + Gabor iris pipeline for pairwise discrimination and key "
+            "recognition operations."
         )
     )
     parser.add_argument(
@@ -370,39 +374,12 @@ def main():
         choices=["casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
         help="Datasets to include in the evaluation.",
     )
-    parser.add_argument(
-        "--rotation",
-        type=int,
-        default=21,
-        help="Rotation count used for pairwise scoring and CLI-style comparisons.",
-    )
-    parser.add_argument(
-        "--speed-runs",
-        type=int,
-        default=300,
-        help="How many repetitions to use per speed benchmark.",
-    )
-    parser.add_argument(
-        "--database-size",
-        type=int,
-        default=64,
-        help="How many enrolled iris codes to use in the find benchmark.",
-    )
-    parser.add_argument(
-        "--skip-pairwise",
-        action="store_true",
-        help="Skip AUC/EER evaluation.",
-    )
-    parser.add_argument(
-        "--skip-speed",
-        action="store_true",
-        help="Skip speed benchmarks.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Directory for JSON output.",
-    )
+    parser.add_argument("--rotation", type=int, default=21, help="Rotation count used for scoring.")
+    parser.add_argument("--speed-runs", type=int, default=300, help="How many repetitions to use per speed benchmark.")
+    parser.add_argument("--database-size", type=int, default=64, help="How many enrolled iris codes to use in the find benchmark.")
+    parser.add_argument("--skip-pairwise", action="store_true", help="Skip AUC/EER evaluation.")
+    parser.add_argument("--skip-speed", action="store_true", help="Skip speed benchmarks.")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for JSON output.")
     parser.add_argument(
         "--output-name",
         default="benchmark_results.json",
@@ -430,6 +407,8 @@ def main():
 
     results = {
         "filters_count": int(len(filters)),
+        "feature_extractor": "gabor_radial_weighted",
+        "segmentation_backend": "unet",
         "rotation": int(args.rotation),
         "pairwise": [],
         "speed": None,
@@ -439,17 +418,9 @@ def main():
         dataset_path, dataset_format = resolve_dataset(None, dataset_format)
         print(f"Evaluating dataset: {dataset_format}")
         if not args.skip_pairwise:
-            pairwise_result = run_pairwise_benchmark(
-                dataset_path,
-                dataset_format,
-                args.rotation,
-                output_dir,
-            )
+            pairwise_result = run_pairwise_benchmark(dataset_path, dataset_format, args.rotation, output_dir)
             results["pairwise"].append(pairwise_result)
-            print(
-                f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} "
-                f"EER={pairwise_result['eer']:.4f}"
-            )
+            print(f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} EER={pairwise_result['eer']:.4f}")
         output_path.write_text(json.dumps(format_result(results), indent=2))
 
     if not args.skip_speed:
@@ -464,7 +435,8 @@ def main():
         results["speed"] = speed_result
         print(
             f"Speed benchmark dataset: {speed_result['dataset_format']} "
-            f"(database_size={speed_result['database_size']}, query={speed_result['query_image']})"
+            f"(feature_extractor={speed_result['feature_extractor']}, database_size={speed_result['database_size']}, "
+            f"query={speed_result['query_image']})"
         )
 
     output_path.write_text(json.dumps(format_result(results), indent=2))
