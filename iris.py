@@ -3,17 +3,87 @@
 import cv2 as cv
 import numpy as np
 import os
+import subprocess
+import tempfile
 from profiling import timeit
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
-from segmentation_geometry import semantic_masks_to_band, DEFAULT_BAND_SHAPE
-DEFAULT_SEGMENTATION_BACKEND = "unet"
-UNET_ONNX_PATH = Path(
+from segmentation_geometry import annulus_mask_to_band, semantic_masks_to_band, DEFAULT_BAND_SHAPE
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_SEGMENTATION_BACKEND = os.environ.get(
+    "SEG_BACKEND",
     os.environ.get(
-        "IRIS_UNET_ONNX_PATH",
-        str(Path(__file__).resolve().parent / "models" / "iris_semseg_upp_scse_mobilenetv2.onnx"),
+        "IRIS_SEG_BACKEND",
+        os.environ.get("IRIS_SEGMENTATION_BACKEND", "onnx"),
+    ),
+).strip().lower()
+
+
+def _resolve_segmentation_model_path():
+    configured = os.environ.get(
+        "SEG_PATH",
+        os.environ.get(
+            "IRIS_SEG_PATH",
+            os.environ.get(
+                "IRIS_SEGMENTATION_ONNX_PATH",
+                os.environ.get(
+                    "IRIS_SEGMENTATION_PATH",
+                    os.environ.get("IRIS_UNET_ONNX_PATH"),
+                ),
+            ),
+        ),
     )
-)
+    if configured is not None:
+        path = Path(configured).expanduser()
+        if path.is_absolute():
+            return path
+        cwd_candidate = path.resolve()
+        if cwd_candidate.exists():
+            return cwd_candidate
+        return (PROJECT_ROOT / path).resolve()
+
+    default_candidates = [
+        PROJECT_ROOT / "models" / "iris_semseg_upp_scse_mobilenetv2.onnx",
+        PROJECT_ROOT / "models" / "upp_scse_mobilenetv2.onnx",
+        PROJECT_ROOT / "models" / "mysegmenter.onnx",
+    ]
+    for candidate in default_candidates:
+        if candidate.exists():
+            return candidate
+    return default_candidates[0]
+
+
+def _resolve_wahet_binary_path():
+    configured = os.environ.get(
+        "WAHET_PATH",
+        os.environ.get("IRIS_WAHET_PATH"),
+    )
+    if configured is not None:
+        path = Path(configured).expanduser()
+        if path.is_absolute():
+            return path
+        cwd_candidate = path.resolve()
+        if cwd_candidate.exists():
+            return cwd_candidate
+        return (PROJECT_ROOT / path).resolve()
+    return PROJECT_ROOT / "wahet"
+
+
+def _normalize_segmentation_backend_name(name):
+    backend_name = str(name).strip().lower()
+    if backend_name in {"onnx", "model", "custom", "unet", "annulus"}:
+        return "onnx"
+    if backend_name == "wahet":
+        return "wahet"
+    raise ValueError(f"Unsupported segmentation backend: {name}")
+
+
+def get_segmentation_backend_name(backend=None):
+    return _normalize_segmentation_backend_name(backend or DEFAULT_SEGMENTATION_BACKEND)
+
+
+UNET_ONNX_PATH = _resolve_segmentation_model_path()
+WAHET_BINARY = _resolve_wahet_binary_path()
 UNET_INPUT_SIZE = (
     int(os.environ.get("IRIS_UNET_INPUT_WIDTH", 480)),
     int(os.environ.get("IRIS_UNET_INPUT_HEIGHT", 640)),
@@ -23,25 +93,43 @@ UNET_BAND_SHAPE = (
     int(os.environ.get("IRIS_UNET_BAND_HEIGHT", DEFAULT_BAND_SHAPE[0])),
     int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
 )
+OUTER_IRIS_WEIGHT = 0.25
+VERTICAL_PAD_MODE = os.environ.get("IRIS_VERTICAL_PAD_MODE", "reflect").strip().lower()
+MASKED_WINDOW_POLICY = os.environ.get("IRIS_MASKED_WINDOW_POLICY", "strict").strip().lower()
+MASK_FILL_MODE = os.environ.get("IRIS_MASK_FILL_MODE", "zero").strip().lower()
 _UNET_NET = None
 
 @timeit
-def hamming_distance(a,b,mask1, mask2):
+def hamming_distance(a,b,mask1, mask2, weights=None):
     diff = np.bitwise_xor(a,b)
     mask = np.bitwise_and(mask1, mask2)
-    total = np.sum(np.bitwise_and(diff, mask))
-    n = np.sum(mask)
+    if weights is None:
+        total = np.sum(np.bitwise_and(diff, mask))
+        n = np.sum(mask)
+    else:
+        weights = np.asarray(weights, dtype=np.float32)
+        weighted_mask = mask.astype(np.float32) * weights
+        total = np.sum(np.bitwise_and(diff, mask).astype(np.float32) * weights)
+        n = np.sum(weighted_mask)
     if n == 0:
         return 2.0
     return total/n
 
 @timeit
-def hamming_distances(a, b, masks_a, mask_b):
+def hamming_distances(a, b, masks_a, mask_b, weights=None):
     diff = np.bitwise_xor(a, b)
     mask = np.bitwise_and(masks_a, mask_b)
     scores = np.full(a.shape[0], 2.0, dtype=np.float64)
-    total = np.sum(np.bitwise_and(diff, mask), axis=1)
-    n = np.sum(mask, axis=1)
+    if weights is None:
+        total = np.sum(np.bitwise_and(diff, mask), axis=1)
+        n = np.sum(mask, axis=1)
+    else:
+        weights = np.asarray(weights, dtype=np.float32)
+        if weights.ndim == 1:
+            weights = weights[None, :]
+        weighted_mask = mask.astype(np.float32) * weights
+        total = np.sum(np.bitwise_and(diff, mask).astype(np.float32) * weights, axis=1)
+        n = np.sum(weighted_mask, axis=1)
     valid = n > 0
     scores[valid] = total[valid] / n[valid]
     return scores
@@ -82,6 +170,77 @@ def complex_to_bits(z, mask_bit_list):
     mask_bits[1::2] = mask_bit_list
     return result, mask_bits
 
+
+def _pad_iris_vertically(iris, pad_top, pad_bottom):
+    if VERTICAL_PAD_MODE in {"reflect", "mirror"}:
+        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="reflect")
+    if VERTICAL_PAD_MODE in {"duplicate", "edge", "replicate"}:
+        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="edge")
+    if VERTICAL_PAD_MODE in {"circular", "wrap"}:
+        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="wrap")
+    if VERTICAL_PAD_MODE in {"zero", "constant"}:
+        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="constant")
+    raise ValueError(
+        "Unsupported IRIS_VERTICAL_PAD_MODE. Use one of: reflect, duplicate, circular, zero."
+    )
+
+
+def _fill_masked_pixels_in_band(iris, mask, mode):
+    mode = mode.strip().lower()
+    if mode in {"zero", "constant"}:
+        filled = iris.copy()
+        filled[mask != 255] = 0
+        return filled
+
+    valid = mask == 255
+    filled = iris.copy()
+    height, width = iris.shape
+
+    for x in range(width):
+        col = filled[:, x]
+        valid_col = valid[:, x]
+        invalid_rows = np.flatnonzero(~valid_col)
+        if invalid_rows.size == 0:
+            continue
+
+        valid_rows = np.flatnonzero(valid_col)
+        if valid_rows.size == 0:
+            col[:] = 0
+            filled[:, x] = col
+            continue
+
+        first_valid = int(valid_rows[0])
+        last_valid = int(valid_rows[-1])
+
+        if mode in {"duplicate", "edge", "replicate"}:
+            for y in invalid_rows:
+                nearest = valid_rows[np.argmin(np.abs(valid_rows - y))]
+                col[y] = col[nearest]
+            filled[:, x] = col
+            continue
+
+        if mode in {"mirror", "reflect"}:
+            for y in invalid_rows:
+                if y < first_valid:
+                    reflected = first_valid + (first_valid - y - 1)
+                    reflected = min(reflected, last_valid)
+                    col[y] = col[reflected]
+                elif y > last_valid:
+                    reflected = last_valid - (y - last_valid - 1)
+                    reflected = max(reflected, first_valid)
+                    col[y] = col[reflected]
+                else:
+                    nearest = valid_rows[np.argmin(np.abs(valid_rows - y))]
+                    col[y] = col[nearest]
+            filled[:, x] = col
+            continue
+
+        raise ValueError(
+            "Unsupported IRIS_MASK_FILL_MODE. Use one of: zero, duplicate, mirror."
+        )
+
+    return filled
+
 def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_positions, mask=None):
     x_stride, y_stride = stride
     iris_h, iris_w = iris.shape
@@ -103,11 +262,11 @@ def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_posit
     extra_top = max(0, -int(y_positions.min()))
     extra_bottom = max(0, int(y_positions.max()) - (iris_h - 1))
 
-    padded_iris = np.pad(
-        iris,
-        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
-        mode="constant",
-    )
+    iris_for_filtering = iris
+    if mask is not None and MASKED_WINDOW_POLICY == "fill":
+        iris_for_filtering = _fill_masked_pixels_in_band(iris, mask, MASK_FILL_MODE)
+
+    padded_iris = _pad_iris_vertically(iris_for_filtering, y_half + extra_top, y_bottom + extra_bottom)
     wrapped_iris = np.concatenate(
         (
             padded_iris[:, -x_half:] if x_half else padded_iris[:, :0],
@@ -146,7 +305,10 @@ def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_posit
     mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
     sampled_mask_rows = mask_windows[y_positions + extra_top]
     sampled_mask = sampled_mask_rows[:, x_positions, :, :]
-    mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    if MASKED_WINDOW_POLICY == "fill":
+        mask_bits = np.any(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    else:
+        mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
     return results, mask_bits
 
 def _resolve_dnn_backend(name):
@@ -175,8 +337,8 @@ def _get_unet_net():
         return _UNET_NET
     if not UNET_ONNX_PATH.exists():
         raise FileNotFoundError(
-            f"U-Net ONNX model not found at '{UNET_ONNX_PATH}'. "
-            "Set IRIS_UNET_ONNX_PATH or place the model there."
+            f"Segmentation ONNX model not found at '{UNET_ONNX_PATH}'. "
+            "Set IRIS_SEGMENTATION_ONNX_PATH or place the model there."
         )
     net = cv.dnn.readNetFromONNX(str(UNET_ONNX_PATH))
     backend_name = os.environ.get("IRIS_UNET_DNN_BACKEND", "opencv").strip().lower()
@@ -198,9 +360,12 @@ def _sigmoid_if_needed(output):
     return output
 
 
-def predict_unet_masks(img):
-    gray = img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    resized = cv.resize(gray, UNET_INPUT_SIZE, interpolation=cv.INTER_LINEAR).astype(np.float32) / 255.0
+def _prepare_segmentation_gray(img):
+    return img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+
+def _forward_segmentation_model(img):
+    source_gray = _prepare_segmentation_gray(img)
+    resized = cv.resize(source_gray, UNET_INPUT_SIZE, interpolation=cv.INTER_LINEAR).astype(np.float32) / 255.0
     rgb = np.repeat(resized[:, :, None], 3, axis=2)
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -209,11 +374,16 @@ def predict_unet_masks(img):
     net = _get_unet_net()
     net.setInput(normalized)
     output = net.forward()
+    return source_gray, output
+
+
+def predict_unet_masks(img):
+    source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4 or output.shape[1] < 3:
-        raise RuntimeError(f"Unexpected U-Net output shape: {output.shape}")
+        raise RuntimeError(f"Unexpected multiclass segmentation output shape: {output.shape}")
 
     probabilities = _sigmoid_if_needed(output[0])
-    image_h, image_w = gray.shape
+    image_h, image_w = source_gray.shape
     resized_probs = np.stack(
         [
             cv.resize(probabilities[index], (image_w, image_h), interpolation=cv.INTER_LINEAR)
@@ -226,14 +396,107 @@ def predict_unet_masks(img):
     iris_mask = resized_probs[1] >= UNET_THRESHOLD
     pupil_mask = resized_probs[2] >= UNET_THRESHOLD
     eyelash_mask = resized_probs[3] >= UNET_THRESHOLD if resized_probs.shape[0] > 3 else np.zeros_like(iris_mask)
-    return gray, iris_mask, pupil_mask, eyelash_mask
+    return source_gray, iris_mask, pupil_mask, eyelash_mask
+
+
+def predict_annulus_mask(img):
+    source_gray, output = _forward_segmentation_model(img)
+    if output.ndim != 4:
+        raise RuntimeError(f"Unexpected annulus model output shape: {output.shape}")
+
+    image_h, image_w = source_gray.shape
+    if output.shape[1] == 1:
+        annulus_prob = _sigmoid_if_needed(output[0, 0])
+    elif output.shape[1] == 2:
+        logits = output[0].astype(np.float32)
+        logits = logits - np.max(logits, axis=0, keepdims=True)
+        exp_logits = np.exp(logits)
+        annulus_prob = exp_logits[1] / np.sum(exp_logits, axis=0)
+    else:
+        raise RuntimeError(
+            f"Binary annulus model must output 1 or 2 channels, got {output.shape[1]}."
+        )
+
+    annulus_prob = cv.resize(annulus_prob, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+    annulus_mask = annulus_prob >= UNET_THRESHOLD
+    return source_gray, annulus_mask
+
+
+@timeit
+def _segment_with_wahet(img):
+    if not WAHET_BINARY.exists():
+        raise FileNotFoundError(
+            f"Wahet executable not found at '{WAHET_BINARY}'. "
+            "Set WAHET_PATH or place the binary there."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="wahet_") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        input_path = temp_dir / "input.png"
+        output_path = temp_dir / "output.png"
+        mask_path = temp_dir / "mask.png"
+
+        if not cv.imwrite(str(input_path), img):
+            raise RuntimeError(f"Failed to write temporary wahet input to '{input_path}'.")
+
+        result = subprocess.run(
+            [str(WAHET_BINARY), "-i", str(input_path), "-o", str(output_path), "-m", str(mask_path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else ""
+            stdout = result.stdout.strip() if result.stdout else ""
+            detail = stderr or stdout or "wahet exited with a non-zero status"
+            raise RuntimeError(f"Wahet segmentation failed: {detail}")
+
+        image = cv.imread(str(output_path), cv.IMREAD_GRAYSCALE)
+        mask = cv.imread(str(mask_path), cv.IMREAD_GRAYSCALE)
+        if image is None or mask is None:
+            raise RuntimeError("Wahet did not produce readable output image and mask.")
+        return image, mask
 
 
 @timeit
 def _segment_with_unet(img):
-    gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(img)
+    source_gray, output = _forward_segmentation_model(img)
+    if output.ndim != 4:
+        raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
+
+    if output.shape[1] in {1, 2}:
+        image_h, image_w = source_gray.shape
+        if output.shape[1] == 1:
+            annulus_prob = _sigmoid_if_needed(output[0, 0])
+        else:
+            logits = output[0].astype(np.float32)
+            logits = logits - np.max(logits, axis=0, keepdims=True)
+            exp_logits = np.exp(logits)
+            annulus_prob = exp_logits[1] / np.sum(exp_logits, axis=0)
+
+        annulus_prob = cv.resize(annulus_prob, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+        annulus_mask = annulus_prob >= UNET_THRESHOLD
+        return annulus_mask_to_band(
+            source_gray,
+            annulus_mask=annulus_mask,
+            band_shape=UNET_BAND_SHAPE,
+            prefer_ellipse=True,
+            source_image_for_saturation=source_gray,
+        )
+
+    probabilities = _sigmoid_if_needed(output[0])
+    image_h, image_w = source_gray.shape
+    resized_probs = np.stack(
+        [
+            cv.resize(probabilities[index], (image_w, image_h), interpolation=cv.INTER_LINEAR)
+            for index in range(probabilities.shape[0])
+        ],
+        axis=0,
+    )
+    iris_mask = resized_probs[1] >= UNET_THRESHOLD
+    pupil_mask = resized_probs[2] >= UNET_THRESHOLD
+    eyelash_mask = resized_probs[3] >= UNET_THRESHOLD if resized_probs.shape[0] > 3 else np.zeros_like(iris_mask)
     return semantic_masks_to_band(
-        gray,
+        source_gray,
         iris_mask=iris_mask,
         pupil_mask=pupil_mask,
         occlusion_mask=eyelash_mask,
@@ -243,7 +506,10 @@ def _segment_with_unet(img):
 
 
 @timeit
-def get_iris_band(img):
+def get_iris_band(img, backend=None):
+    backend_name = get_segmentation_backend_name(backend)
+    if backend_name == "wahet":
+        return _segment_with_wahet(img)
     return _segment_with_unet(img)
 
 class IrisClassifier():
@@ -261,6 +527,33 @@ class IrisClassifier():
             imag_filter = imag_filter - np.mean(imag_filter)
             self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
+        self._bit_weight_cache = {}
+
+    def get_bit_weights(self, iris_shape):
+        iris_shape = tuple(int(v) for v in iris_shape)
+        cached = self._bit_weight_cache.get(iris_shape)
+        if cached is not None:
+            return cached
+
+        iris_h, iris_w = iris_shape
+        weight_chunks = []
+        for filter_settings in self._filter_settings:
+            x_stride, y_stride = filter_settings["stride"]
+            start_x, start_y = filter_settings["start_position"]
+            num_x = iris_w // x_stride
+            num_y = iris_h // y_stride
+            y_positions = start_y + y_stride * np.arange(num_y, dtype=np.float32)
+            normalized_radius = np.clip(y_positions / max(iris_h - 1, 1), 0.0, 1.0)
+            row_weights = 1.0 - (1.0 - OUTER_IRIS_WEIGHT) * normalized_radius
+            location_weights = np.tile(row_weights.astype(np.float32), num_x)
+            bit_weights = np.empty(location_weights.size * 2, dtype=np.float32)
+            bit_weights[0::2] = location_weights
+            bit_weights[1::2] = location_weights
+            weight_chunks.append(bit_weights)
+
+        weights = np.concatenate(weight_chunks, axis=0)
+        self._bit_weight_cache[iris_shape] = weights
+        return weights
 
     @timeit
     def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0):
@@ -319,10 +612,11 @@ class IrisClassifier():
     
     @timeit
     def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
+        bit_weights = self.get_bit_weights(iris.shape)
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
-            return (hamming_distance(bits, iris_code, mask, iris_code_mask), 0)
+            return (hamming_distance(bits, iris_code, mask, iris_code_mask, weights=bit_weights), 0)
         offsets = np.arange(rotation) - rotation // 2
         bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
-        scores = hamming_distances(bits, iris_code, masks, iris_code_mask)
+        scores = hamming_distances(bits, iris_code, masks, iris_code_mask, weights=bit_weights)
         return (np.min(scores), np.argmin(scores)-rotation//2)

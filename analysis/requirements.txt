@@ -1,0 +1,10 @@
+numpy
+opencv-python-headless
+matplotlib
+seaborn
+scikit-learn
+click
+torch
+torchvision
+segmentation-models-pytorch
+onnx

@@ -75,6 +75,24 @@ def clean_component_mask(mask, kernel_size=5):
     return _largest_component(opened)
 
 
+def pupil_mask_from_annulus(annulus_mask):
+    annulus = clean_component_mask(annulus_mask)
+    if not np.any(annulus):
+        raise ValueError("Cannot derive a pupil mask from an empty annulus mask.")
+
+    annulus = (annulus > 0).astype(np.uint8)
+    inverse = (annulus == 0).astype(np.uint8)
+    flood = inverse.copy()
+    h, w = flood.shape
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv.floodFill(flood, flood_mask, (0, 0), 2)
+    hole = (flood == 1).astype(np.uint8)
+    hole = clean_component_mask(hole, kernel_size=3)
+    if not np.any(hole):
+        raise ValueError("Failed to derive a pupil mask from annulus mask.")
+    return hole
+
+
 def contour_center(mask):
     component = clean_component_mask(mask)
     if not np.any(component):
@@ -268,6 +286,52 @@ def normalize_iris_from_boundaries(
     )
 
     return np.clip(band, 0, 255).astype(np.uint8), (sampled_mask > 0).astype(np.uint8) * 255
+
+
+def annulus_mask_to_band(
+    image,
+    annulus_mask,
+    band_shape=DEFAULT_BAND_SHAPE,
+    prefer_ellipse=True,
+    source_image_for_saturation=None,
+):
+    annulus_mask = clean_component_mask(annulus_mask)
+    if not np.any(annulus_mask):
+        raise ValueError("Annulus mask is empty.")
+
+    pupil_mask = pupil_mask_from_annulus(annulus_mask)
+    pupil_ellipse = fit_boundary_from_mask(pupil_mask, prefer_ellipse=prefer_ellipse)
+    center = (pupil_ellipse.center_x, pupil_ellipse.center_y)
+
+    pupil_boundary = fit_polar_boundary_from_mask(
+        pupil_mask,
+        center=center,
+        num_angles=band_shape[1],
+        smooth_kernel=7,
+        fallback_to_ellipse=True,
+    )
+    iris_boundary = fit_polar_boundary_from_mask(
+        annulus_mask,
+        center=center,
+        num_angles=band_shape[1],
+        smooth_kernel=17,
+        fallback_to_ellipse=True,
+    )
+
+    valid_source_mask = annulus_mask.astype(np.uint8) * 255
+    if source_image_for_saturation is not None:
+        valid_source_mask &= (np.asarray(source_image_for_saturation) < 254).astype(np.uint8) * 255
+
+    if np.mean(iris_boundary.radii) <= np.mean(pupil_boundary.radii):
+        raise ValueError("Iris boundary must be larger than pupil boundary.")
+
+    return normalize_iris_from_boundaries(
+        image=image,
+        pupil_boundary=pupil_boundary,
+        iris_boundary=iris_boundary,
+        valid_source_mask=valid_source_mask,
+        band_shape=band_shape,
+    )
 
 def semantic_masks_to_band(
     image,

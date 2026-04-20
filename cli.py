@@ -112,13 +112,14 @@ def find(filename, codes_path, rotation, threshold):
 
     offsets = np.arange(rotation) - rotation // 2
     iris_codes, mask_codes, _ = iris_classifier.get_iris_codes(iris, mask, offsets=offsets)
+    bit_weights = iris_classifier.get_bit_weights(iris.shape)
     
     best_match = None
     best_score = float('inf')
 
     # Evaluate all database entries across all rotations and keep the global best
     for j in range(codes.shape[1]):
-        scores = hamming_distances(iris_codes, codes[0, j], mask_codes, codes[1, j])
+        scores = hamming_distances(iris_codes, codes[0, j], mask_codes, codes[1, j], weights=bit_weights)
         curr_score = float(np.min(scores))
         if curr_score < best_score:
             best_score = curr_score

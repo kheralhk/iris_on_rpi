@@ -16,13 +16,21 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset_loaders import load_dataset, resolve_dataset
 from filters import filters
-from iris import IrisClassifier, get_iris_band, hamming_distances, predict_unet_masks
+from iris import (
+    IrisClassifier,
+    get_iris_band,
+    get_segmentation_backend_name,
+    hamming_distances,
+    predict_annulus_mask,
+    predict_unet_masks,
+)
 
 try:
-    from segmentation_geometry import build_valid_source_mask, clean_component_mask
+    from segmentation_geometry import build_valid_source_mask, clean_component_mask, pupil_mask_from_annulus
 except ImportError:
     build_valid_source_mask = None
     clean_component_mask = None
+    pupil_mask_from_annulus = None
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "mask_occlusion_tests"
@@ -43,40 +51,69 @@ def segment_image(image):
     return iris_band, iris_mask
 
 
-def get_unet_source_debug(image):
-    if build_valid_source_mask is None or clean_component_mask is None:
+def get_source_debug(image):
+    if get_segmentation_backend_name() == "wahet":
+        raise RuntimeError("Wahet backend does not expose source segmentation masks for overlay export.")
+    if clean_component_mask is None:
         raise RuntimeError("Source overlays require segmentation geometry helpers.")
-    gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
-    iris_mask = clean_component_mask(iris_mask)
-    pupil_mask = clean_component_mask(pupil_mask)
-    eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
-    if np.any(eyelash_mask):
-        eyelash_mask = cv.dilate(
+    try:
+        gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
+        if build_valid_source_mask is None:
+            raise RuntimeError("Source overlays require segmentation geometry helpers.")
+        iris_mask = clean_component_mask(iris_mask)
+        pupil_mask = clean_component_mask(pupil_mask)
+        eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
+        if np.any(eyelash_mask):
+            eyelash_mask = cv.dilate(
+                eyelash_mask,
+                cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
+                iterations=1,
+            )
+        valid_mask = build_valid_source_mask(
+            iris_mask,
+            pupil_mask,
             eyelash_mask,
-            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
+            source_image=gray,
+            oversat_threshold=254,
         )
-    valid_mask = build_valid_source_mask(
-        iris_mask,
-        pupil_mask,
-        eyelash_mask,
-        source_image=gray,
-        oversat_threshold=254,
-    )
-    annulus = ((iris_mask > 0) & ~(pupil_mask > 0))
-    valid = valid_mask > 0
-    excluded = annulus & ~valid
-    return {
-        "gray": gray,
-        "annulus": annulus.astype(np.uint8) * 255,
-        "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
-        "excluded": excluded.astype(np.uint8) * 255,
-        "valid": valid.astype(np.uint8) * 255,
-        "base_title": "Original Eye Image",
-        "overlay_title": "Source Mask Overlay",
-        "valid_title": "Valid Iris Area",
-        "excluded_title": "Excluded Iris Area",
-    }
+        annulus = ((iris_mask > 0) & ~(pupil_mask > 0))
+        valid = valid_mask > 0
+        excluded = annulus & ~valid
+        return {
+            "gray": gray,
+            "annulus": annulus.astype(np.uint8) * 255,
+            "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
+            "excluded": excluded.astype(np.uint8) * 255,
+            "valid": valid.astype(np.uint8) * 255,
+            "base_title": "Original Eye Image",
+            "overlay_title": "Source Mask Overlay",
+            "valid_title": "Valid Iris Area",
+            "excluded_title": "Excluded Iris Area",
+        }
+    except RuntimeError as exc:
+        if "Unexpected multiclass segmentation output shape" not in str(exc):
+            raise
+        if pupil_mask_from_annulus is None:
+            raise RuntimeError("Annulus overlays require segmentation geometry helpers.")
+        gray, annulus_mask = predict_annulus_mask(image)
+        annulus_mask = clean_component_mask(annulus_mask)
+        try:
+            pupil_mask = pupil_mask_from_annulus(annulus_mask)
+        except Exception:
+            pupil_mask = np.zeros_like(annulus_mask, dtype=np.uint8)
+        valid = annulus_mask > 0
+        excluded = np.zeros_like(valid, dtype=bool)
+        return {
+            "gray": gray,
+            "annulus": annulus_mask.astype(np.uint8) * 255,
+            "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
+            "excluded": excluded.astype(np.uint8) * 255,
+            "valid": valid.astype(np.uint8) * 255,
+            "base_title": "Original Eye Image",
+            "overlay_title": "Annulus Mask Overlay",
+            "valid_title": "Annulus Area",
+            "excluded_title": "Excluded Area",
+        }
 
 def sample_dataset(
     images,
@@ -246,14 +283,26 @@ def save_source_overlay_preview(output_path, source_debug):
 
 
 def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations):
-    source_debug = get_unet_source_debug(raw_image)
+    source_debug = get_source_debug(raw_image)
     save_source_overlay_preview(output_path, source_debug)
 
 
 def run_single(args):
     classifier = IrisClassifier(filters)
     image_path, image = load_image(args.image)
-    iris_band, iris_mask = segment_image(image)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = image_path.stem
+    overlay_path = output_dir / f"{stem}_{args.output_name}.png"
+    save_overlay_preview(overlay_path, image, None, None, args.kernel_size, args.iterations)
+
+    try:
+        iris_band, iris_mask = segment_image(image)
+    except Exception as exc:
+        print(f"Image: {image_path}")
+        print(f"Segmentation failed before normalization/matching: {exc}")
+        print(f"Saved overlay preview to: {overlay_path}")
+        return
 
     enlarged_mask = build_enlarged_mask(iris_mask, args.kernel_size, args.iterations)
     occluded_iris = apply_synthetic_occlusion(
@@ -292,15 +341,8 @@ def run_single(args):
     enlarged_valid_fraction = float(np.mean(enlarged_mask == 255))
     newly_masked_pixels = int(np.sum((iris_mask == 255) & (enlarged_mask != 255)))
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = image_path.stem
-
-    overlay_path = output_dir / f"{stem}_{args.output_label}.png"
-    save_overlay_preview(overlay_path, image, iris_band, iris_mask, args.kernel_size, args.iterations)
-
     print(f"Image: {image_path}")
-    print("Backend: unet")
+    print(f"Backend: {get_segmentation_backend_name()}")
     print(f"Original valid fraction: {original_valid_fraction:.4f}")
     print(f"Enlarged valid fraction: {enlarged_valid_fraction:.4f}")
     print(f"Newly masked pixels: {newly_masked_pixels}")
@@ -336,14 +378,13 @@ def run_multiple(args):
     for index, image in enumerate(images, start=1):
         if index == 1 or index % 10 == 0 or index == len(images):
             print(f"Segmenting samples: {index}/{len(images)}")
-        iris_band, iris_mask = get_iris_band(image)
-        if iris_band is None or iris_mask is None:
+        name = Path(str(image_names[index - 1])).stem
+        overlay_path = output_dir / f"{name}_{args.output_name}.png"
+        try:
+            save_overlay_preview(overlay_path, image, None, None, args.kernel_size, args.iterations)
+        except Exception:
             skipped.append(str(image_names[index - 1]))
             continue
-
-        name = Path(str(image_names[index - 1])).stem
-        overlay_path = output_dir / f"{name}_{args.output_label}.png"
-        save_overlay_preview(overlay_path, image, iris_band, iris_mask, args.kernel_size, args.iterations)
         saved += 1
 
     print(f"Saved overlay previews: {saved}")
@@ -376,7 +417,9 @@ def build_parser():
     single.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
     single.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     single.add_argument(
+        "--output-name",
         "--output-label",
+        dest="output_name",
         default="mask_occlusion_overlay",
         help="Filename label after the image stem, for example 'source_mask' -> S1129R05_source_mask.png.",
     )
@@ -399,7 +442,7 @@ def build_parser():
     multiple.add_argument(
         "--dataset-format",
         default="casia-v3-interval",
-        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
+        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
         help="Dataset folder layout to load.",
     )
     multiple.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
@@ -414,7 +457,9 @@ def build_parser():
     )
     multiple.add_argument("--seed", type=int, default=0, help="Random seed for deterministic sampling.")
     multiple.add_argument(
+        "--output-name",
         "--output-label",
+        dest="output_name",
         default="mask_occlusion_overlay",
         help="Filename label after each image stem, for example 'source_mask' -> S1129R05_source_mask.png.",
     )

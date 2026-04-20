@@ -24,6 +24,7 @@ from iris import IrisClassifier, get_iris_band
 
 DEFAULT_DATASET_FORMAT = "auto"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "pairwise_iris_analysis_output"
+MATCHER_IRISCODE = "iriscode"
 
 
 def dataset_output_slug(dataset_format):
@@ -68,27 +69,38 @@ def sample_dataset(
     return sampled_images, sampled_labels, sampled_image_names
 
 
-def precompute_codes(images, image_names, classifier, rotation):
+def precompute_codes(images, labels, image_names, classifier, rotation):
     offsets = np.arange(rotation) - rotation // 2
     sample_count = len(images)
+    bit_weights = None
 
     base_codes = []
     base_masks = []
     rotated_codes = []
     rotated_masks = []
+    kept_labels = []
+    kept_image_names = []
+    skipped = []
     for index, image in enumerate(images, start=1):
         if index == 1 or index % 25 == 0 or index == sample_count:
             print(f"Precomputing iris codes: {index}/{sample_count}")
 
-        iris_band, iris_mask = get_iris_band(image)
+        try:
+            iris_band, iris_mask = get_iris_band(image)
+        except Exception as exc:
+            skipped.append((index - 1, str(image_names[index - 1]), str(exc)))
+            continue
         if iris_band is None or iris_mask is None:
-            raise RuntimeError(
-                f"Segmentation failed for sample index {index - 1}: {image_names[index - 1]}"
-            )
+            skipped.append((index - 1, str(image_names[index - 1]), "segmentation returned None"))
+            continue
+        if bit_weights is None:
+            bit_weights = classifier.get_bit_weights(iris_band.shape)
 
         base_code, base_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=0)
         base_codes.append(np.asarray(base_code, dtype=bool))
         base_masks.append(np.asarray(base_mask, dtype=bool))
+        kept_labels.append(labels[index - 1])
+        kept_image_names.append(image_names[index - 1])
 
         image_rotated_codes = []
         image_rotated_masks = []
@@ -100,20 +112,32 @@ def precompute_codes(images, image_names, classifier, rotation):
         rotated_codes.append(np.stack(image_rotated_codes, axis=0))
         rotated_masks.append(np.stack(image_rotated_masks, axis=0))
 
+    if not base_codes:
+        raise RuntimeError("Segmentation failed for every sampled image.")
+
     return (
         np.stack(base_codes, axis=0),
         np.stack(base_masks, axis=0),
         np.stack(rotated_codes, axis=0),
         np.stack(rotated_masks, axis=0),
         offsets,
+        bit_weights,
+        np.array(kept_labels),
+        np.array(kept_image_names),
+        skipped,
     )
 
 
-def best_score_against_rotations(base_code, base_mask, candidate_codes, candidate_masks):
+def best_score_against_rotations(base_code, base_mask, candidate_codes, candidate_masks, bit_weights=None):
     diff = np.bitwise_xor(candidate_codes, base_code)
     combined_mask = np.bitwise_and(candidate_masks, base_mask)
-    valid_bits = np.sum(combined_mask, axis=1)
-    mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask), axis=1)
+    if bit_weights is None:
+        valid_bits = np.sum(combined_mask, axis=1)
+        mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask), axis=1)
+    else:
+        weighted_mask = combined_mask.astype(np.float32) * bit_weights[None, :]
+        valid_bits = np.sum(weighted_mask, axis=1)
+        mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask).astype(np.float32) * bit_weights[None, :], axis=1)
 
     scores = np.full(candidate_codes.shape[0], 2.0, dtype=np.float64)
     valid_rows = valid_bits > 0
@@ -123,7 +147,7 @@ def best_score_against_rotations(base_code, base_mask, candidate_codes, candidat
     return float(scores[best_index]), best_index
 
 
-def compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets):
+def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets, bit_weights=None):
     idx1_list = []
     idx2_list = []
     score_list = []
@@ -140,12 +164,14 @@ def compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotat
             base_masks[idx1],
             rotated_codes[idx2],
             rotated_masks[idx2],
+            bit_weights=bit_weights,
         )
         score_21, offset_index_21 = best_score_against_rotations(
             base_codes[idx2],
             base_masks[idx2],
             rotated_codes[idx1],
             rotated_masks[idx1],
+            bit_weights=bit_weights,
         )
 
         if score_12 <= score_21:
@@ -176,6 +202,9 @@ def compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotat
         "best_offset": np.array(best_offset_list, dtype=np.int16),
         "direction": np.array(direction_list, dtype=np.int8),
     }
+
+
+compute_pairwise_scores = compute_pairwise_scores_iriscode
 
 
 def summarize_label_pairs(labels):
@@ -212,7 +241,7 @@ def evaluate_scores(same_class, scores):
     }
 
 
-def save_results(output_path, pairwise, evaluation, labels, image_names, dataset_path, rotation):
+def save_results(output_path, pairwise, evaluation, labels, image_names, dataset_path, rotation, matcher):
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -239,17 +268,21 @@ def save_results(output_path, pairwise, evaluation, labels, image_names, dataset
         roc_auc=np.array(evaluation["roc_auc"]),
         dataset_path=np.array(str(Path(dataset_path).expanduser().resolve())),
         rotation=np.array(rotation),
+        matcher=np.array(matcher),
     )
     return output
 
 
-def plot_results(scores, same_class, evaluation, figure_path=None):
+def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCHER_IRISCODE):
     mated_scores = scores[same_class]
     non_mated_scores = scores[~same_class]
     fpr = evaluation["fpr"]
     positive_fpr = fpr[fpr > 0.0]
     min_log_fpr = max(float(positive_fpr.min()) / 10.0, 1e-6) if positive_fpr.size else 1e-6
     plot_fpr = np.maximum(fpr, min_log_fpr)
+    distribution_title = "Hamming Distance Distribution"
+    x_label = "Hamming Distance"
+    x_limit = (0.0, 0.6)
 
     sns.set_theme(style="whitegrid")
     figure, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -263,10 +296,11 @@ def plot_results(scores, same_class, evaluation, figure_path=None):
         fill=True,
         alpha=0.55,
     )
-    axes[0].set_title("Hamming Distance Distribution")
-    axes[0].set_xlabel("Hamming Distance")
+    axes[0].set_title(distribution_title)
+    axes[0].set_xlabel(x_label)
     axes[0].set_ylabel("Density")
-    axes[0].set_xlim(0.0, 0.6)
+    if x_limit is not None:
+        axes[0].set_xlim(*x_limit)
     axes[0].legend(loc="upper right")
 
     axes[1].plot(
@@ -308,7 +342,7 @@ def main():
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
+        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
         help="Dataset folder layout to load",
     )
     parser.add_argument(
@@ -322,7 +356,9 @@ def main():
         help="Output image path for the distribution/ROC figure. Defaults to fltr_ana_<dataset>.png",
     )
     parser.add_argument(
+        "--output-name",
         "--figure-name",
+        dest="output_name",
         default=None,
         help="Output filename for the figure inside the default output directory. Example: my_run.png",
     )
@@ -360,19 +396,20 @@ def main():
 
     if args.rotation < 1:
         raise ValueError("--rotation must be at least 1")
-    if args.figure_output and args.figure_name:
-        raise ValueError("Use either --figure-output or --figure-name, not both.")
+    if args.figure_output and args.output_name:
+        raise ValueError("Use either --figure-output or --output-name, not both.")
 
     dataset_path, dataset_format = resolve_dataset(args.dataset_path, args.dataset_format)
     dataset_name = dataset_output_slug(dataset_format)
     figure_output = args.figure_output
-    if figure_output is None and args.figure_name is not None:
-        figure_name = args.figure_name
-        if Path(figure_name).suffix == "":
-            figure_name = f"{figure_name}.png"
-        figure_output = str(DEFAULT_OUTPUT_DIR / figure_name)
+    if figure_output is None and args.output_name is not None:
+        output_name = args.output_name
+        if Path(output_name).suffix == "":
+            output_name = f"{output_name}.png"
+        figure_output = str(DEFAULT_OUTPUT_DIR / output_name)
     if figure_output is None:
-        figure_output = str(DEFAULT_OUTPUT_DIR / f"fltr_ana_{dataset_name}.png")
+        default_name = f"fltr_ana_{dataset_name}.png"
+        figure_output = str(DEFAULT_OUTPUT_DIR / default_name)
 
     print(f"Using dataset format: {dataset_format}")
     print(f"Dataset name: {dataset_name}")
@@ -388,26 +425,61 @@ def main():
         max_images_per_identity=args.max_images_per_identity,
         seed=args.seed,
     )
-    summary = summarize_label_pairs(labels)
-    print(f"Samples: {summary['sample_count']}")
-    print(f"Classes: {summary['class_count']}")
-    print(f"Total unordered pairs: {summary['total_pairs']}")
-    print(f"Mated pairs: {summary['mated_pairs']}")
-    print(f"Non-mated pairs: {summary['non_mated_pairs']}")
-    if summary["mated_pairs"] == 0 or summary["non_mated_pairs"] == 0:
+    pre_summary = summarize_label_pairs(labels)
+    print(f"Samples: {pre_summary['sample_count']}")
+    print(f"Classes: {pre_summary['class_count']}")
+    print(f"Total unordered pairs: {pre_summary['total_pairs']}")
+    print(f"Mated pairs: {pre_summary['mated_pairs']}")
+    print(f"Non-mated pairs: {pre_summary['non_mated_pairs']}")
+    if pre_summary["mated_pairs"] == 0 or pre_summary["non_mated_pairs"] == 0:
         raise ValueError(
             "The sampled subset does not contain both mated and non-mated pairs. "
             "Use a larger subset and prefer --max-images-per-identity 2 or more."
         )
     classifier = IrisClassifier(filters)
-
-    base_codes, base_masks, rotated_codes, rotated_masks, offsets = precompute_codes(
+    (
+        base_codes,
+        base_masks,
+        rotated_codes,
+        rotated_masks,
+        offsets,
+        bit_weights,
+        labels,
+        image_names,
+        skipped,
+    ) = precompute_codes(
         images,
+        labels,
         image_names,
         classifier,
         args.rotation,
     )
-    pairwise = compute_pairwise_scores(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets)
+    if skipped:
+        print(f"Skipped {len(skipped)} images due to segmentation failure.")
+        for skipped_index, skipped_name, reason in skipped[:5]:
+            print(f"  skipped[{skipped_index}] {skipped_name}: {reason}")
+        if len(skipped) > 5:
+            print(f"  ... {len(skipped) - 5} more skipped images")
+
+    summary = summarize_label_pairs(labels)
+    print(f"Usable after segmentation: {summary['sample_count']}")
+    print(f"Usable classes: {summary['class_count']}")
+    print(f"Usable unordered pairs: {summary['total_pairs']}")
+    print(f"Usable mated pairs: {summary['mated_pairs']}")
+    print(f"Usable non-mated pairs: {summary['non_mated_pairs']}")
+    if summary["mated_pairs"] == 0 or summary["non_mated_pairs"] == 0:
+        raise ValueError(
+            "After removing segmentation failures, the subset no longer contains both mated and non-mated pairs."
+        )
+    pairwise = compute_pairwise_scores_iriscode(
+        labels,
+        base_codes,
+        base_masks,
+        rotated_codes,
+        rotated_masks,
+        offsets,
+        bit_weights=bit_weights,
+    )
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
     if args.output:
@@ -419,13 +491,14 @@ def main():
             image_names,
             dataset_path,
             args.rotation,
+            MATCHER_IRISCODE,
         )
         print(f"Saved pairwise results to {output_path}")
     print(f"EER: {evaluation['eer']:.6f}")
     print(f"EER threshold: {evaluation['eer_threshold']:.6f}")
     print(f"ROC AUC: {evaluation['roc_auc']:.6f}")
 
-    plot_results(pairwise["scores"], pairwise["same_class"], evaluation, figure_path=figure_output)
+    plot_results(pairwise["scores"], pairwise["same_class"], evaluation, figure_path=figure_output, matcher=MATCHER_IRISCODE)
     print(f"Saved analysis figure to {Path(figure_output).expanduser().resolve()}")
 
 

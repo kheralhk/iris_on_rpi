@@ -16,9 +16,10 @@ if str(ANALYSIS_ROOT) not in sys.path:
 
 from dataset_loaders import load_dataset, resolve_dataset
 from filters import filters
-from iris import IrisClassifier, get_iris_band, hamming_distances
+from iris import IrisClassifier, get_iris_band, get_segmentation_backend_name, hamming_distances
 from pairwise_iris_analysis import (
-    compute_pairwise_scores,
+    MATCHER_IRISCODE,
+    compute_pairwise_scores_iriscode,
     evaluate_scores,
     precompute_codes,
     sample_dataset,
@@ -40,6 +41,12 @@ DEFAULT_PAIRWISE_CONFIGS = {
         "max_images_per_identity": 2,
         "seed": 0,
     },
+    "casia-v4-interval": {
+        "max_samples": None,
+        "max_identities": 250,
+        "max_images_per_identity": 2,
+        "seed": 0,
+    },
     "casia-v3-lamp": {
         "max_samples": None,
         "max_identities": 250,
@@ -49,6 +56,30 @@ DEFAULT_PAIRWISE_CONFIGS = {
     "casia-v3-twins": {
         "max_samples": None,
         "max_identities": 200,
+        "max_images_per_identity": 2,
+        "seed": 0,
+    },
+    "ubiris-v2": {
+        "max_samples": None,
+        "max_identities": 250,
+        "max_images_per_identity": 2,
+        "seed": 0,
+    },
+    "iitd": {
+        "max_samples": None,
+        "max_identities": 224,
+        "max_images_per_identity": 2,
+        "seed": 0,
+    },
+    "mmu": {
+        "max_samples": None,
+        "max_identities": None,
+        "max_images_per_identity": 2,
+        "seed": 0,
+    },
+    "mmu2": {
+        "max_samples": None,
+        "max_identities": None,
         "max_images_per_identity": 2,
         "seed": 0,
     },
@@ -70,7 +101,10 @@ def format_result(value):
 
 
 def segment_image(image):
-    return get_iris_band(image)
+    try:
+        return get_iris_band(image)
+    except Exception:
+        return None, None
 
 
 def benchmark(name, runs, func):
@@ -240,46 +274,58 @@ def compare_iris_codes_operation(query_code, compare_code):
     )[0]
     return float(score)
 
-
-def build_functional_summary(operations):
+def build_functional_summary(operations, matcher):
     operation_lookup = {item["name"]: item for item in operations}
     compare_score = float(operation_lookup["compare_image"]["last_result"][0])
-    compare_iris_codes_score = float(operation_lookup["compare_iris_codes"]["last_result"])
+    compare_template_score = float(operation_lookup["compare_templates"]["last_result"])
     find_index = int(operation_lookup["find"]["last_result"][0])
     find_score = float(operation_lookup["find"]["last_result"][1])
 
-    genuine_below_default_threshold = compare_score < 0.3
-    iris_code_score_below_default_threshold = compare_iris_codes_score < 0.3
-    find_score_below_default_threshold = find_score < 0.3
     mate_found = find_index == 0
+    default_threshold = 0.3 if matcher == MATCHER_IRISCODE else None
 
-    passed = bool(
-        genuine_below_default_threshold
-        and iris_code_score_below_default_threshold
-        and find_score_below_default_threshold
-        and mate_found
-    )
-    return {
-        "is_functional_iris_recognizer": "yes" if passed else "no",
-        "checks": {
+    if default_threshold is None:
+        threshold_checks = {
+            "genuine_image_score_below_default_threshold": None,
+            "genuine_template_score_below_default_threshold": None,
+            "find_score_below_default_threshold": None,
+            "find_returns_enrolled_mate": bool(mate_found),
+        }
+        passed = bool(mate_found)
+    else:
+        genuine_below_default_threshold = compare_score < default_threshold
+        template_score_below_default_threshold = compare_template_score < default_threshold
+        find_score_below_default_threshold = find_score < default_threshold
+        threshold_checks = {
             "genuine_image_score_below_default_threshold": bool(genuine_below_default_threshold),
-            "genuine_iris_code_score_below_default_threshold": bool(iris_code_score_below_default_threshold),
+            "genuine_template_score_below_default_threshold": bool(template_score_below_default_threshold),
             "find_score_below_default_threshold": bool(find_score_below_default_threshold),
             "find_returns_enrolled_mate": bool(mate_found),
-        },
+        }
+        passed = bool(
+            genuine_below_default_threshold
+            and template_score_below_default_threshold
+            and find_score_below_default_threshold
+            and mate_found
+        )
+
+    return {
+        "is_functional_iris_recognizer": "yes" if passed else "no",
+        "matcher": matcher,
+        "default_threshold": default_threshold,
+        "checks": threshold_checks,
         "details": {
             "compare_image_score": compare_score,
-            "compare_iris_codes_score": compare_iris_codes_score,
+            "compare_template_score": compare_template_score,
             "find_index": find_index,
             "find_score": find_score,
         },
     }
 
-
 def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size):
-    classifier = IrisClassifier(filters)
     samples = find_speed_benchmark_samples(dataset_path, dataset_format, database_size)
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
+    classifier = IrisClassifier(filters)
     codes = build_database(classifier, database_samples)
     query_code = np.stack(
         classifier.get_iris_code(query["iris_band"], query["iris_mask"])[:2],
@@ -295,22 +341,24 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
         benchmark("enroll", runs, lambda: enroll_operation(classifier, query)),
         benchmark("compare_image", runs, lambda: compare_image_operation(classifier, query, compare_sample, rotation)),
         benchmark(
-            "compare_iris_codes",
+            "compare_templates",
             runs,
             lambda: compare_iris_codes_operation((query_code[0], query_code[1], bit_weights), compare_code),
         ),
         benchmark("find", runs, lambda: find_operation(classifier, query, codes, rotation)),
     ]
+    feature_extractor = "gabor_radial_weighted"
 
     return {
         "dataset_format": dataset_format,
-        "feature_extractor": "gabor_radial_weighted",
-        "segmentation_backend": "unet",
+        "matcher": MATCHER_IRISCODE,
+        "feature_extractor": feature_extractor,
+        "segmentation_backend": get_segmentation_backend_name(),
         "query_image": query["image_name"],
         "compare_image": compare_sample["image_name"],
         "database_size": int(database_size),
         "operations": operations,
-        "functional_summary": build_functional_summary(operations),
+        "functional_summary": build_functional_summary(operations, MATCHER_IRISCODE),
     }
 
 
@@ -327,16 +375,27 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
         seed=config["seed"],
     )
 
-    summary = summarize_label_pairs(labels)
     classifier = IrisClassifier(filters)
-    base_codes, base_masks, rotated_codes, rotated_masks, offsets, bit_weights = precompute_codes(
+    (
+        base_codes,
+        base_masks,
+        rotated_codes,
+        rotated_masks,
+        offsets,
+        bit_weights,
+        kept_labels,
+        kept_image_names,
+        skipped,
+    ) = precompute_codes(
         images,
+        labels,
         image_names,
         classifier,
         rotation,
     )
-    pairwise = compute_pairwise_scores(
-        labels,
+    summary = summarize_label_pairs(kept_labels)
+    pairwise = compute_pairwise_scores_iriscode(
+        kept_labels,
         base_codes,
         base_masks,
         rotated_codes,
@@ -344,16 +403,20 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
         offsets,
         bit_weights=bit_weights,
     )
+    feature_extractor = "gabor_radial_weighted"
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
     return {
         "dataset_format": dataset_format,
-        "feature_extractor": "gabor_radial_weighted",
-        "segmentation_backend": "unet",
+        "matcher": MATCHER_IRISCODE,
+        "feature_extractor": feature_extractor,
+        "segmentation_backend": get_segmentation_backend_name(),
         "dataset_path": str(dataset_path),
         "sample_summary": summary,
         "sampling": config,
         "rotation": int(rotation),
+        "kept_sample_count": int(len(kept_labels)),
+        "skipped_sample_count": int(len(skipped)),
         "eer": float(evaluation["eer"]),
         "eer_threshold": float(evaluation["eer_threshold"]),
         "roc_auc": float(evaluation["roc_auc"]),
@@ -370,8 +433,18 @@ def main():
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
-        choices=["casia-v1", "casia-v3-interval", "casia-v3-lamp", "casia-v3-twins"],
+        default=[
+            "casia-v1",
+            "casia-v3-interval",
+            "casia-v4-interval",
+            "casia-v3-lamp",
+            "casia-v3-twins",
+            "ubiris-v2",
+            "iitd",
+            "mmu",
+            "mmu2",
+        ],
+        choices=["casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
         help="Datasets to include in the evaluation.",
     )
     parser.add_argument("--rotation", type=int, default=21, help="Rotation count used for scoring.")
@@ -407,8 +480,9 @@ def main():
 
     results = {
         "filters_count": int(len(filters)),
+        "matcher": MATCHER_IRISCODE,
         "feature_extractor": "gabor_radial_weighted",
-        "segmentation_backend": "unet",
+        "segmentation_backend": get_segmentation_backend_name(),
         "rotation": int(args.rotation),
         "pairwise": [],
         "speed": None,
@@ -418,7 +492,12 @@ def main():
         dataset_path, dataset_format = resolve_dataset(None, dataset_format)
         print(f"Evaluating dataset: {dataset_format}")
         if not args.skip_pairwise:
-            pairwise_result = run_pairwise_benchmark(dataset_path, dataset_format, args.rotation, output_dir)
+            pairwise_result = run_pairwise_benchmark(
+                dataset_path,
+                dataset_format,
+                args.rotation,
+                output_dir,
+            )
             results["pairwise"].append(pairwise_result)
             print(f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} EER={pairwise_result['eer']:.4f}")
         output_path.write_text(json.dumps(format_result(results), indent=2))

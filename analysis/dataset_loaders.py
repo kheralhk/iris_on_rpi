@@ -1,38 +1,45 @@
 # dataset_loaders.py
 
 from pathlib import Path
+import re
 
 import cv2 as cv
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATASETS_ROOT = PROJECT_ROOT.parent / "datasets"
 
-CASIA_V1_PATH = Path(
-    "/Users/krist/Documents/project/casia/CASIA Version.1/CASIA Iris Image Database (version 1.0)"
-)
-CASIA_V3_INTERVAL_PATH = Path(
-    "/Users/krist/Documents/project/casia/CASIA-IrisV3/CASIA-IrisV3-Interval"
-)
-CASIA_V3_LAMP_PATH = Path(
-    "/Users/krist/Documents/project/casia/CASIA-IrisV3/CASIA-IrisV3-Lamp"
-)
-CASIA_V3_TWINS_PATH = Path(
-    "/Users/krist/Documents/project/casia/CASIA-IrisV3/CASIA-IrisV3-Twins"
-)
+CASIA_V1_PATH = DATASETS_ROOT / "CASIA Version.1" / "CASIA Iris Image Database (version 1.0)"
+CASIA_V3_INTERVAL_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Interval"
+CASIA_V4_INTERVAL_PATH = DATASETS_ROOT / "CASIA-IrisV4-Interval"
+CASIA_V3_LAMP_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Lamp"
+CASIA_V3_TWINS_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Twins"
+UBIRIS_V2_PATH = DATASETS_ROOT / "Ubiris v2"
+IITD_PATH = DATASETS_ROOT / "IIT Delhi Iris Database"
+MMU_PATH = DATASETS_ROOT / "MMU" / "MMU Iris Database"
+MMU2_PATH = DATASETS_ROOT / "MMU" / "MMU2 Iris Database" / "MMU2 Iris Database"
 
 
-def _load_images_with_labels(dataset_dir, image_paths, label_builder):
-    images = []
+def _build_index(dataset_dir, image_paths, label_builder):
+    paths = []
     labels = []
     names = []
-
     for image_path in image_paths:
-        image = cv.imread(str(image_path), cv.IMREAD_GRAYSCALE)
-        if image is None:
-            raise FileNotFoundError(f"Failed to load image '{image_path}'.")
-
-        images.append(image)
+        paths.append(image_path)
         labels.append(label_builder(image_path))
         names.append(str(image_path.relative_to(dataset_dir)))
+    return paths, np.array(labels), np.array(names)
+
+
+def _load_images_with_labels(dataset_dir, image_paths, label_builder, imread_flag=cv.IMREAD_GRAYSCALE):
+    paths, labels, names = _build_index(dataset_dir, image_paths, label_builder)
+    images = []
+    for image_path in paths:
+        image = cv.imread(str(image_path), imread_flag)
+        if image is None:
+            raise FileNotFoundError(f"Failed to load image '{image_path}'.")
+        images.append(image)
+    return images, labels, names
 
     return images, np.array(labels), np.array(names)
 
@@ -64,6 +71,24 @@ def load_casia_v3_interval(dataset_path):
     if not image_paths:
         raise FileNotFoundError(
             "No CASIA-IrisV3 Interval images were found. Expected files like XXX/L/S1XXXL01.jpg."
+        )
+
+    return _load_images_with_labels(
+        dataset_dir,
+        image_paths,
+        lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+    )
+
+
+def load_casia_v4_interval(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+    if not image_paths:
+        raise FileNotFoundError(
+            "No CASIA-IrisV4 Interval images were found. Expected files like XXX/L/S1XXXL01.jpg."
         )
 
     return _load_images_with_labels(
@@ -109,6 +134,104 @@ def load_casia_v3_twins(dataset_path):
     )
 
 
+def load_ubiris_v2(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(
+        path
+        for path in dataset_dir.glob("CLASSES_*/*.tiff")
+        if path.name.lower() not in {"thumbs.db", ".ds_store"}
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            "No UBIRIS V2 images were found. Expected files like CLASSES_400_300_Part1/C100_S1_I1.tiff."
+        )
+
+    def label_builder(image_path):
+        match = re.match(r"C(\d+)_S\d+_I\d+$", image_path.stem, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Unexpected UBIRIS filename format: {image_path.name}")
+        return f"C{match.group(1)}"
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
+def load_iitd(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(
+        path
+        for path in dataset_dir.glob("[0-9][0-9][0-9]/*.bmp")
+        if path.name.lower() not in {"thumbs.db", ".ds_store"}
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            "No IITD images were found. Expected files like 001/01_L.bmp or 014/06_R.bmp."
+        )
+
+    def label_builder(image_path):
+        match = re.match(r"\d+_([LR])$", image_path.stem, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Unexpected IITD filename format: {image_path.name}")
+        return f"{image_path.parent.name}_{match.group(1).upper()}"
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
+def load_mmu(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(
+        path for path in dataset_dir.glob("*/*/*.bmp") if path.name.lower() not in {"thumbs.db", ".ds_store"}
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            "No MMU images were found. Expected files like 1/left/aeval1.bmp or 1/right/aevar1.bmp."
+        )
+
+    def label_builder(image_path):
+        side = image_path.parent.name.lower()
+        if side not in {"left", "right"}:
+            raise ValueError(f"Unexpected MMU directory structure: {image_path}")
+        side_code = "L" if side == "left" else "R"
+        return f"{image_path.parent.parent.name}_{side_code}"
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
+def load_mmu2(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(
+        path for path in dataset_dir.glob("*.bmp") if path.name.lower() not in {"thumbs.db", ".ds_store"}
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            "No MMU2 images were found. Expected files like 010101.bmp or 1000205.bmp."
+        )
+
+    def label_builder(image_path):
+        stem = image_path.stem
+        if len(stem) < 6 or not stem.isdigit():
+            raise ValueError(f"Unexpected MMU2 filename format: {image_path.name}")
+        subject = stem[:-4]
+        eye_code = stem[-4:-2]
+        if eye_code not in {"01", "02"}:
+            raise ValueError(f"Unexpected MMU2 eye code in filename: {image_path.name}")
+        side_code = "L" if eye_code == "01" else "R"
+        return f"{subject}_{side_code}"
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
 def resolve_dataset(dataset_path, dataset_format):
     if dataset_path:
         resolved_path = Path(dataset_path).expanduser().resolve()
@@ -116,10 +239,17 @@ def resolve_dataset(dataset_path, dataset_format):
             raise FileNotFoundError(f"Dataset directory does not exist: {resolved_path}")
 
         if dataset_format == "auto":
+            name = resolved_path.name.lower()
             if any(resolved_path.glob("*/*/*.bmp")):
-                return resolved_path, "casia-v1"
+                if "casia" in name and "version.1" in str(resolved_path).lower():
+                    return resolved_path, "casia-v1"
+                if "iit" in name:
+                    return resolved_path, "iitd"
+                if "mmu iris database" in name:
+                    return resolved_path, "mmu"
             if any(resolved_path.glob("*/*/*.jpg")):
-                name = resolved_path.name.lower()
+                if "v4" in name and "interval" in name:
+                    return resolved_path, "casia-v4-interval"
                 if "interval" in name:
                     return resolved_path, "casia-v3-interval"
                 if "lamp" in name:
@@ -127,6 +257,11 @@ def resolve_dataset(dataset_path, dataset_format):
                 if "twins" in name:
                     return resolved_path, "casia-v3-twins"
                 return resolved_path, "casia-v3-interval"
+            if any(resolved_path.glob("CLASSES_*/*.tiff")):
+                return resolved_path, "ubiris-v2"
+            if any(resolved_path.glob("*.bmp")):
+                if "mmu2 iris database" in name:
+                    return resolved_path, "mmu2"
             raise FileNotFoundError(
                 f"Could not infer dataset format from '{resolved_path}'. "
                 "Use --dataset-format explicitly."
@@ -138,10 +273,20 @@ def resolve_dataset(dataset_path, dataset_format):
         return CASIA_V1_PATH, "casia-v1"
     if dataset_format in ("auto", "casia-v3-interval") and CASIA_V3_INTERVAL_PATH.exists():
         return CASIA_V3_INTERVAL_PATH, "casia-v3-interval"
+    if dataset_format in ("auto", "casia-v4-interval") and CASIA_V4_INTERVAL_PATH.exists():
+        return CASIA_V4_INTERVAL_PATH, "casia-v4-interval"
     if dataset_format in ("auto", "casia-v3-lamp") and CASIA_V3_LAMP_PATH.exists():
         return CASIA_V3_LAMP_PATH, "casia-v3-lamp"
     if dataset_format in ("auto", "casia-v3-twins") and CASIA_V3_TWINS_PATH.exists():
         return CASIA_V3_TWINS_PATH, "casia-v3-twins"
+    if dataset_format in ("auto", "ubiris-v2") and UBIRIS_V2_PATH.exists():
+        return UBIRIS_V2_PATH, "ubiris-v2"
+    if dataset_format in ("auto", "iitd") and IITD_PATH.exists():
+        return IITD_PATH, "iitd"
+    if dataset_format in ("auto", "mmu") and MMU_PATH.exists():
+        return MMU_PATH, "mmu"
+    if dataset_format in ("auto", "mmu2") and MMU2_PATH.exists():
+        return MMU2_PATH, "mmu2"
 
     raise FileNotFoundError(
         "Could not find a default dataset path. "
@@ -149,7 +294,11 @@ def resolve_dataset(dataset_path, dataset_format):
         f"{CASIA_V1_PATH}\n"
         f"{CASIA_V3_INTERVAL_PATH}\n"
         f"{CASIA_V3_LAMP_PATH}\n"
-        f"{CASIA_V3_TWINS_PATH}"
+        f"{CASIA_V3_TWINS_PATH}\n"
+        f"{UBIRIS_V2_PATH}\n"
+        f"{IITD_PATH}\n"
+        f"{MMU_PATH}\n"
+        f"{MMU2_PATH}"
     )
 
 
@@ -158,8 +307,108 @@ def load_dataset(dataset_path, dataset_format):
         return load_casia_v1(dataset_path)
     if dataset_format == "casia-v3-interval":
         return load_casia_v3_interval(dataset_path)
+    if dataset_format == "casia-v4-interval":
+        return load_casia_v4_interval(dataset_path)
     if dataset_format == "casia-v3-lamp":
         return load_casia_v3_lamp(dataset_path)
     if dataset_format == "casia-v3-twins":
         return load_casia_v3_twins(dataset_path)
+    if dataset_format == "ubiris-v2":
+        return load_ubiris_v2(dataset_path)
+    if dataset_format == "iitd":
+        return load_iitd(dataset_path)
+    if dataset_format == "mmu":
+        return load_mmu(dataset_path)
+    if dataset_format == "mmu2":
+        return load_mmu2(dataset_path)
+    raise ValueError(f"Unsupported dataset format: {dataset_format}")
+
+
+def load_dataset_index(dataset_path, dataset_format):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if dataset_format == "casia-v1":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.bmp"))
+        return _build_index(
+            dataset_dir,
+            image_paths,
+            lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+        )
+    if dataset_format == "casia-v3-interval":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+        return _build_index(
+            dataset_dir,
+            image_paths,
+            lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+        )
+    if dataset_format == "casia-v4-interval":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+        return _build_index(
+            dataset_dir,
+            image_paths,
+            lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+        )
+    if dataset_format == "casia-v3-lamp":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+        return _build_index(
+            dataset_dir,
+            image_paths,
+            lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+        )
+    if dataset_format == "casia-v3-twins":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+        return _build_index(
+            dataset_dir,
+            image_paths,
+            lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
+        )
+    if dataset_format == "ubiris-v2":
+        image_paths = sorted(
+            path
+            for path in dataset_dir.glob("CLASSES_*/*.tiff")
+            if path.name.lower() not in {"thumbs.db", ".ds_store"}
+        )
+        def label_builder(image_path):
+            match = re.match(r"C(\d+)_S\d+_I\d+$", image_path.stem, flags=re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Unexpected UBIRIS filename format: {image_path.name}")
+            return f"C{match.group(1)}"
+        return _build_index(dataset_dir, image_paths, label_builder)
+    if dataset_format == "iitd":
+        image_paths = sorted(
+            path
+            for path in dataset_dir.glob("[0-9][0-9][0-9]/*.bmp")
+            if path.name.lower() not in {"thumbs.db", ".ds_store"}
+        )
+        def label_builder(image_path):
+            match = re.match(r"\d+_([LR])$", image_path.stem, flags=re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Unexpected IITD filename format: {image_path.name}")
+            return f"{image_path.parent.name}_{match.group(1).upper()}"
+        return _build_index(dataset_dir, image_paths, label_builder)
+    if dataset_format == "mmu":
+        image_paths = sorted(
+            path for path in dataset_dir.glob("*/*/*.bmp") if path.name.lower() not in {"thumbs.db", ".ds_store"}
+        )
+        def label_builder(image_path):
+            side = image_path.parent.name.lower()
+            if side not in {"left", "right"}:
+                raise ValueError(f"Unexpected MMU directory structure: {image_path}")
+            side_code = "L" if side == "left" else "R"
+            return f"{image_path.parent.parent.name}_{side_code}"
+        return _build_index(dataset_dir, image_paths, label_builder)
+    if dataset_format == "mmu2":
+        image_paths = sorted(
+            path for path in dataset_dir.glob("*.bmp") if path.name.lower() not in {"thumbs.db", ".ds_store"}
+        )
+        def label_builder(image_path):
+            stem = image_path.stem
+            if len(stem) < 6 or not stem.isdigit():
+                raise ValueError(f"Unexpected MMU2 filename format: {image_path.name}")
+            subject = stem[:-4]
+            eye_code = stem[-4:-2]
+            if eye_code not in {"01", "02"}:
+                raise ValueError(f"Unexpected MMU2 eye code in filename: {image_path.name}")
+            side_code = "L" if eye_code == "01" else "R"
+            return f"{subject}_{side_code}"
+        return _build_index(dataset_dir, image_paths, label_builder)
     raise ValueError(f"Unsupported dataset format: {dataset_format}")
