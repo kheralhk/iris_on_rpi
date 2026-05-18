@@ -102,6 +102,7 @@ def main():
     if args.rotation == 0:
         args.rotation = None
 
+    print(f"Filters in use: {len(filters)}")
     classifier = IrisClassifier(filters)
 
     raw_image1 = load_image(args.image1)

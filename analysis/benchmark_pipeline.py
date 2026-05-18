@@ -14,15 +14,14 @@ ANALYSIS_ROOT = Path(__file__).resolve().parent
 if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
-from dataset_loaders import load_dataset, resolve_dataset
-from filters import filters
-from iris import IrisClassifier, get_iris_band, get_segmentation_backend_name, hamming_distances
+from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
+from filter_loader import load_filter_bank
+from iris import IrisClassifier, UNET_ONNX_PATH, get_iris_band, get_segmentation_backend_name, hamming_distances
 from pairwise_iris_analysis import (
     MATCHER_IRISCODE,
     compute_pairwise_scores_iriscode,
     evaluate_scores,
     precompute_codes,
-    sample_dataset,
     summarize_label_pairs,
 )
 
@@ -245,7 +244,6 @@ def find_operation(classifier, sample, codes, rotation):
         sample["iris_mask"],
         offsets=offsets,
     )
-    bit_weights = classifier.get_bit_weights(sample["iris_band"].shape)
     best_match = None
     best_score = float("inf")
     for index in range(codes.shape[1]):
@@ -254,7 +252,6 @@ def find_operation(classifier, sample, codes, rotation):
             codes[0, index],
             mask_codes,
             codes[1, index],
-            weights=bit_weights,
         )
         curr_score = float(np.min(curr_scores))
         if curr_score < best_score:
@@ -264,13 +261,11 @@ def find_operation(classifier, sample, codes, rotation):
 
 
 def compare_iris_codes_operation(query_code, compare_code):
-    bit_weights = query_code[2]
     score = hamming_distances(
         query_code[0][None, :],
         compare_code[0],
         query_code[1][None, :],
         compare_code[1],
-        weights=bit_weights,
     )[0]
     return float(score)
 
@@ -322,10 +317,10 @@ def build_functional_summary(operations, matcher):
         },
     }
 
-def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size):
+def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_size, selected_filters, filters_source):
     samples = find_speed_benchmark_samples(dataset_path, dataset_format, database_size)
     query, compare_sample, database_samples = select_benchmark_samples(samples, database_size)
-    classifier = IrisClassifier(filters)
+    classifier = IrisClassifier(selected_filters)
     codes = build_database(classifier, database_samples)
     query_code = np.stack(
         classifier.get_iris_code(query["iris_band"], query["iris_mask"])[:2],
@@ -335,25 +330,26 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
         classifier.get_iris_code(compare_sample["iris_band"], compare_sample["iris_mask"])[:2],
         axis=0,
     ).astype(bool)
-    bit_weights = classifier.get_bit_weights(query["iris_band"].shape)
-
     operations = [
         benchmark("enroll", runs, lambda: enroll_operation(classifier, query)),
         benchmark("compare_image", runs, lambda: compare_image_operation(classifier, query, compare_sample, rotation)),
         benchmark(
             "compare_templates",
             runs,
-            lambda: compare_iris_codes_operation((query_code[0], query_code[1], bit_weights), compare_code),
+            lambda: compare_iris_codes_operation((query_code[0], query_code[1]), compare_code),
         ),
         benchmark("find", runs, lambda: find_operation(classifier, query, codes, rotation)),
     ]
-    feature_extractor = "gabor_radial_weighted"
+    feature_extractor = "gabor"
 
     return {
         "dataset_format": dataset_format,
         "matcher": MATCHER_IRISCODE,
         "feature_extractor": feature_extractor,
+        "filters_source": filters_source,
+        "filters_count": int(len(selected_filters)),
         "segmentation_backend": get_segmentation_backend_name(),
+        "segmentation_model_path": str(UNET_ONNX_PATH),
         "query_image": query["image_name"],
         "compare_image": compare_sample["image_name"],
         "database_size": int(database_size),
@@ -362,7 +358,7 @@ def run_speed_benchmark(dataset_path, dataset_format, rotation, runs, database_s
     }
 
 
-def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
+def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir, selected_filters, filters_source):
     config = DEFAULT_PAIRWISE_CONFIGS[dataset_format]
     images, labels, image_names = load_dataset(dataset_path, dataset_format)
     images, labels, image_names = sample_dataset(
@@ -375,14 +371,13 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
         seed=config["seed"],
     )
 
-    classifier = IrisClassifier(filters)
+    classifier = IrisClassifier(selected_filters)
     (
         base_codes,
         base_masks,
         rotated_codes,
         rotated_masks,
         offsets,
-        bit_weights,
         kept_labels,
         kept_image_names,
         skipped,
@@ -401,16 +396,18 @@ def run_pairwise_benchmark(dataset_path, dataset_format, rotation, output_dir):
         rotated_codes,
         rotated_masks,
         offsets,
-        bit_weights=bit_weights,
     )
-    feature_extractor = "gabor_radial_weighted"
+    feature_extractor = "gabor"
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
     return {
         "dataset_format": dataset_format,
         "matcher": MATCHER_IRISCODE,
         "feature_extractor": feature_extractor,
+        "filters_source": filters_source,
+        "filters_count": int(len(selected_filters)),
         "segmentation_backend": get_segmentation_backend_name(),
+        "segmentation_model_path": str(UNET_ONNX_PATH),
         "dataset_path": str(dataset_path),
         "sample_summary": summary,
         "sampling": config,
@@ -444,7 +441,7 @@ def main():
             "mmu",
             "mmu2",
         ],
-        choices=["casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
+        choices=[dataset for dataset in DATASET_CHOICES if dataset != "auto"],
         help="Datasets to include in the evaluation.",
     )
     parser.add_argument("--rotation", type=int, default=21, help="Rotation count used for scoring.")
@@ -453,6 +450,11 @@ def main():
     parser.add_argument("--skip-pairwise", action="store_true", help="Skip AUC/EER evaluation.")
     parser.add_argument("--skip-speed", action="store_true", help="Skip speed benchmarks.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for JSON output.")
+    parser.add_argument(
+        "--filters",
+        default=None,
+        help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
+    )
     parser.add_argument(
         "--output-name",
         default="benchmark_results.json",
@@ -477,12 +479,17 @@ def main():
         output_dir = Path(args.output_dir).expanduser().resolve()
         output_path = output_dir / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    selected_filters, filters_source = load_filter_bank(args.filters)
+    print(f"Filters in use: {len(selected_filters)}")
+    print(f"Filters source: {filters_source}")
 
     results = {
-        "filters_count": int(len(filters)),
+        "filters_count": int(len(selected_filters)),
+        "filters_source": filters_source,
         "matcher": MATCHER_IRISCODE,
-        "feature_extractor": "gabor_radial_weighted",
+        "feature_extractor": "gabor",
         "segmentation_backend": get_segmentation_backend_name(),
+        "segmentation_model_path": str(UNET_ONNX_PATH),
         "rotation": int(args.rotation),
         "pairwise": [],
         "speed": None,
@@ -497,6 +504,8 @@ def main():
                 dataset_format,
                 args.rotation,
                 output_dir,
+                selected_filters,
+                filters_source,
             )
             results["pairwise"].append(pairwise_result)
             print(f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} EER={pairwise_result['eer']:.4f}")
@@ -510,6 +519,8 @@ def main():
             args.rotation,
             args.speed_runs,
             args.database_size,
+            selected_filters,
+            filters_source,
         )
         results["speed"] = speed_result
         print(

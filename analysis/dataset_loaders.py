@@ -1,6 +1,7 @@
 # dataset_loaders.py
 
 from pathlib import Path
+import random
 import re
 
 import cv2 as cv
@@ -18,6 +19,61 @@ UBIRIS_V2_PATH = DATASETS_ROOT / "Ubiris v2"
 IITD_PATH = DATASETS_ROOT / "IIT Delhi Iris Database"
 MMU_PATH = DATASETS_ROOT / "MMU" / "MMU Iris Database"
 MMU2_PATH = DATASETS_ROOT / "MMU" / "MMU2 Iris Database" / "MMU2 Iris Database"
+
+DATASET_CHOICES = [
+    "auto",
+    "casia-v1",
+    "casia-v3-interval",
+    "casia-v4-interval",
+    "casia-v3-lamp",
+    "casia-v3-twins",
+    "ubiris-v2",
+    "iitd",
+    "mmu",
+    "mmu2",
+]
+
+
+def dataset_output_slug(dataset_format):
+    return str(dataset_format).replace("-", "")
+
+
+def sample_dataset(
+    images,
+    labels,
+    image_names,
+    max_samples=None,
+    max_identities=None,
+    max_images_per_identity=None,
+    seed=0,
+):
+    if max_samples is None and max_identities is None and max_images_per_identity is None:
+        return images, labels, image_names
+
+    rng = random.Random(seed)
+    label_to_indices = {}
+    for index, label in enumerate(labels):
+        label_to_indices.setdefault(label, []).append(index)
+
+    selected_labels = list(label_to_indices.keys())
+    if max_identities is not None and max_identities < len(selected_labels):
+        selected_labels = rng.sample(selected_labels, max_identities)
+
+    selected_indices = []
+    for label in selected_labels:
+        indices = list(label_to_indices[label])
+        if max_images_per_identity is not None and max_images_per_identity < len(indices):
+            indices = rng.sample(indices, max_images_per_identity)
+        selected_indices.extend(indices)
+
+    if max_samples is not None and max_samples < len(selected_indices):
+        selected_indices = rng.sample(selected_indices, max_samples)
+
+    selected_indices.sort()
+    sampled_images = [images[index] for index in selected_indices]
+    sampled_labels = labels[selected_indices]
+    sampled_image_names = image_names[selected_indices]
+    return sampled_images, sampled_labels, sampled_image_names
 
 
 def _build_index(dataset_dir, image_paths, label_builder):

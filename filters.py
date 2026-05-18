@@ -29,9 +29,4 @@ filters = [
     "padding": "default",
     "start_position": (8, 8)},
 
-    {"filter": {"size": (33,33), "sigma": 3, "theta": 0, "lambd": 2, "psi": 0, "gamma": 0.5},
-    "stride": (32, 32),
-    "padding": "default",
-    "start_position": (16, 16)},
-    
 ]

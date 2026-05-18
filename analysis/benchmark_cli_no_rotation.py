@@ -1,6 +1,7 @@
 # benchmark_cli_no_rotation
 
 from argparse import ArgumentParser
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -22,6 +23,14 @@ from pairwise_iris_analysis import (
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / Path(__file__).stem
+
+
+def add_figure_metadata(figure, metadata):
+    if not metadata:
+        return
+    text = " | ".join(f"{key}={value}" for key, value in metadata.items() if value is not None)
+    if text:
+        figure.text(0.01, 0.01, text, ha="left", va="bottom", fontsize=7, family="monospace", wrap=True)
 
 
 def load_image(path):
@@ -133,8 +142,6 @@ def find_operation(classifier, query_image, codes, rotation):
         iris_mask,
         offsets=offsets,
     )
-    bit_weights = classifier.get_bit_weights(iris_band.shape)
-
     best_match = None
     best_score = float("inf")
     for index in range(codes.shape[1]):
@@ -144,7 +151,6 @@ def find_operation(classifier, query_image, codes, rotation):
                 codes[0, index],
                 np.asarray(mask, dtype=bool),
                 codes[1, index],
-                weights=bit_weights,
             )
             for code, mask in zip(iris_codes, mask_codes)
         ]
@@ -154,7 +160,7 @@ def find_operation(classifier, query_image, codes, rotation):
             best_match = index
 
     return best_match, best_score
-def plot_benchmark_results(results, output_name, title):
+def plot_benchmark_results(results, output_name, title, metadata=None):
     labels = [
         "Enroll",
         "Compare Iris Code",
@@ -182,7 +188,8 @@ def plot_benchmark_results(results, output_name, title):
                 ha="center",
                 va="bottom",
             )
-        figure.tight_layout()
+        add_figure_metadata(figure, metadata or {})
+        figure.tight_layout(rect=(0, 0.06, 1, 1))
         figure.savefig(output, dpi=200, bbox_inches="tight")
         plt.close(figure)
         print(f"Saved benchmark plot to {output}")
@@ -197,7 +204,12 @@ def main():
         nargs="+",
         help="Images to enroll into an in-memory database for the find benchmark",
     )
-    parser.add_argument("--rotation", type=int, default=1, help="Rotation count used for comparison and find operations.")
+    parser.add_argument(
+        "--rotation",
+        type=int,
+        default=1,
+        help="Rotation count used for comparison and find operations. The default 1 keeps the no-rotation behavior.",
+    )
     parser.add_argument("--runs", type=int, default=100, help="Number of runs per benchmark")
     parser.add_argument(
         "--output-name",
@@ -210,11 +222,14 @@ def main():
 
     if args.runs < 1:
         raise ValueError("--runs must be at least 1")
+    if args.rotation < 1:
+        raise ValueError("--rotation must be at least 1")
 
     query_image = load_image(args.query_image)
     compare_image = load_image(args.compare_image)
     database_images = args.database_images if args.database_images else [args.query_image, args.compare_image]
 
+    print(f"Filters in use: {len(filters)}")
     classifier = IrisClassifier(filters)
     stored_database = build_database(
         classifier,
@@ -246,7 +261,22 @@ def main():
 
     rotation_label = "No Rotation" if args.rotation <= 1 else f"Rotation {args.rotation}"
     title = f"CLI Benchmark ({MATCHER_IRISCODE}, {rotation_label})"
-    plot_benchmark_results(results, args.output_name, title)
+    plot_benchmark_results(
+        results,
+        args.output_name,
+        title,
+        metadata={
+            "query_image": Path(args.query_image).name,
+            "compare_image": Path(args.compare_image).name,
+            "database_images": len(database_images),
+            "rotation": args.rotation,
+            "runs": args.runs,
+            "matcher": MATCHER_IRISCODE,
+            "seg_path": os.environ.get("SEG_PATH"),
+            "filter_count": len(filters),
+            "output_name": args.output_name,
+        },
+    )
 
 
 if __name__ == "__main__":

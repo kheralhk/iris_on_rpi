@@ -4,7 +4,6 @@ from argparse import ArgumentParser
 from itertools import combinations
 import os
 from pathlib import Path
-import random
 import sys
 import time
 
@@ -17,62 +16,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset_loaders import load_dataset, resolve_dataset
-from filters import filters
+from dataset_loaders import DATASET_CHOICES, dataset_output_slug, load_dataset, resolve_dataset, sample_dataset
+from filter_loader import load_filter_bank
 from iris import IrisClassifier, get_iris_band
 
 
 DEFAULT_DATASET_FORMAT = "auto"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "pairwise_iris_analysis_output"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "pairwise_iris_analysis"
 MATCHER_IRISCODE = "iriscode"
 
 
-def dataset_output_slug(dataset_format):
-    return dataset_format.replace("-", "")
-
-
-def sample_dataset(
-    images,
-    labels,
-    image_names,
-    max_samples=None,
-    max_identities=None,
-    max_images_per_identity=None,
-    seed=0,
-):
-    if max_samples is None and max_identities is None and max_images_per_identity is None:
-        return images, labels, image_names
-
-    rng = random.Random(seed)
-    label_to_indices = {}
-    for index, label in enumerate(labels):
-        label_to_indices.setdefault(label, []).append(index)
-
-    selected_labels = list(label_to_indices.keys())
-    if max_identities is not None and max_identities < len(selected_labels):
-        selected_labels = rng.sample(selected_labels, max_identities)
-
-    selected_indices = []
-    for label in selected_labels:
-        indices = list(label_to_indices[label])
-        if max_images_per_identity is not None and max_images_per_identity < len(indices):
-            indices = rng.sample(indices, max_images_per_identity)
-        selected_indices.extend(indices)
-
-    if max_samples is not None and max_samples < len(selected_indices):
-        selected_indices = rng.sample(selected_indices, max_samples)
-
-    selected_indices.sort()
-    sampled_images = [images[index] for index in selected_indices]
-    sampled_labels = labels[selected_indices]
-    sampled_image_names = image_names[selected_indices]
-    return sampled_images, sampled_labels, sampled_image_names
+def add_figure_metadata(figure, metadata):
+    if not metadata:
+        return
+    text = " | ".join(f"{key}={value}" for key, value in metadata.items() if value is not None)
+    if text:
+        figure.text(0.01, 0.01, text, ha="left", va="bottom", fontsize=7, family="monospace", wrap=True)
 
 
 def precompute_codes(images, labels, image_names, classifier, rotation):
     offsets = np.arange(rotation) - rotation // 2
     sample_count = len(images)
-    bit_weights = None
 
     base_codes = []
     base_masks = []
@@ -82,7 +46,7 @@ def precompute_codes(images, labels, image_names, classifier, rotation):
     kept_image_names = []
     skipped = []
     for index, image in enumerate(images, start=1):
-        if index == 1 or index % 25 == 0 or index == sample_count:
+        if index == 1 or index % 100 == 0 or index == sample_count:
             print(f"Precomputing iris codes: {index}/{sample_count}")
 
         try:
@@ -93,8 +57,6 @@ def precompute_codes(images, labels, image_names, classifier, rotation):
         if iris_band is None or iris_mask is None:
             skipped.append((index - 1, str(image_names[index - 1]), "segmentation returned None"))
             continue
-        if bit_weights is None:
-            bit_weights = classifier.get_bit_weights(iris_band.shape)
 
         base_code, base_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=0)
         base_codes.append(np.asarray(base_code, dtype=bool))
@@ -121,23 +83,17 @@ def precompute_codes(images, labels, image_names, classifier, rotation):
         np.stack(rotated_codes, axis=0),
         np.stack(rotated_masks, axis=0),
         offsets,
-        bit_weights,
         np.array(kept_labels),
         np.array(kept_image_names),
         skipped,
     )
 
 
-def best_score_against_rotations(base_code, base_mask, candidate_codes, candidate_masks, bit_weights=None):
+def best_score_against_rotations(base_code, base_mask, candidate_codes, candidate_masks):
     diff = np.bitwise_xor(candidate_codes, base_code)
     combined_mask = np.bitwise_and(candidate_masks, base_mask)
-    if bit_weights is None:
-        valid_bits = np.sum(combined_mask, axis=1)
-        mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask), axis=1)
-    else:
-        weighted_mask = combined_mask.astype(np.float32) * bit_weights[None, :]
-        valid_bits = np.sum(weighted_mask, axis=1)
-        mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask).astype(np.float32) * bit_weights[None, :], axis=1)
+    valid_bits = np.sum(combined_mask, axis=1)
+    mismatch_bits = np.sum(np.bitwise_and(diff, combined_mask), axis=1)
 
     scores = np.full(candidate_codes.shape[0], 2.0, dtype=np.float64)
     valid_rows = valid_bits > 0
@@ -147,7 +103,7 @@ def best_score_against_rotations(base_code, base_mask, candidate_codes, candidat
     return float(scores[best_index]), best_index
 
 
-def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets, bit_weights=None):
+def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets):
     idx1_list = []
     idx2_list = []
     score_list = []
@@ -164,14 +120,12 @@ def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_cod
             base_masks[idx1],
             rotated_codes[idx2],
             rotated_masks[idx2],
-            bit_weights=bit_weights,
         )
         score_21, offset_index_21 = best_score_against_rotations(
             base_codes[idx2],
             base_masks[idx2],
             rotated_codes[idx1],
             rotated_masks[idx1],
-            bit_weights=bit_weights,
         )
 
         if score_12 <= score_21:
@@ -273,7 +227,7 @@ def save_results(output_path, pairwise, evaluation, labels, image_names, dataset
     return output
 
 
-def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCHER_IRISCODE):
+def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCHER_IRISCODE, metadata=None):
     mated_scores = scores[same_class]
     non_mated_scores = scores[~same_class]
     fpr = evaluation["fpr"]
@@ -320,7 +274,8 @@ def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCH
     axes[1].set_ylim(0.0, 1.0)
     axes[1].legend(loc="lower right")
 
-    figure.tight_layout()
+    add_figure_metadata(figure, metadata or {})
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
 
     if figure_path:
         output = Path(figure_path).expanduser().resolve()
@@ -342,7 +297,7 @@ def main():
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
+        choices=DATASET_CHOICES,
         help="Dataset folder layout to load",
     )
     parser.add_argument(
@@ -369,6 +324,11 @@ def main():
         help="Number of horizontal offsets to evaluate around zero",
     )
     parser.add_argument(
+        "--filters",
+        default=None,
+        help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -381,9 +341,11 @@ def main():
         help="Randomly sample at most this many identities.",
     )
     parser.add_argument(
+        "--max-img-per-id",
         "--max-images-per-identity",
+        dest="max_images_per_identity",
         type=int,
-        default=None,
+        default=20,
         help="Randomly sample at most this many images per identity.",
     )
     parser.add_argument(
@@ -436,14 +398,16 @@ def main():
             "The sampled subset does not contain both mated and non-mated pairs. "
             "Use a larger subset and prefer --max-images-per-identity 2 or more."
         )
-    classifier = IrisClassifier(filters)
+    selected_filters, filters_source = load_filter_bank(args.filters)
+    print(f"Filters in use: {len(selected_filters)}")
+    print(f"Filters source: {filters_source}")
+    classifier = IrisClassifier(selected_filters)
     (
         base_codes,
         base_masks,
         rotated_codes,
         rotated_masks,
         offsets,
-        bit_weights,
         labels,
         image_names,
         skipped,
@@ -478,7 +442,6 @@ def main():
         rotated_codes,
         rotated_masks,
         offsets,
-        bit_weights=bit_weights,
     )
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
 
@@ -498,7 +461,33 @@ def main():
     print(f"EER threshold: {evaluation['eer_threshold']:.6f}")
     print(f"ROC AUC: {evaluation['roc_auc']:.6f}")
 
-    plot_results(pairwise["scores"], pairwise["same_class"], evaluation, figure_path=figure_output, matcher=MATCHER_IRISCODE)
+    plot_metadata = {
+        "dataset": dataset_format,
+        "dataset_path": dataset_path,
+        "seg_path": os.environ.get("SEG_PATH"),
+        "output_name": args.output_name,
+        "rotation": args.rotation,
+        "samples": summary["sample_count"],
+        "classes": summary["class_count"],
+        "mated_pairs": summary["mated_pairs"],
+        "non_mated_pairs": summary["non_mated_pairs"],
+        "max_samples": args.max_samples,
+        "max_identities": args.max_identities,
+        "max_images_per_identity": args.max_images_per_identity,
+        "seed": args.seed,
+        "matcher": MATCHER_IRISCODE,
+        "filter_count": len(selected_filters),
+        "filters": filters_source,
+        "skipped": len(skipped),
+    }
+    plot_results(
+        pairwise["scores"],
+        pairwise["same_class"],
+        evaluation,
+        figure_path=figure_output,
+        matcher=MATCHER_IRISCODE,
+        metadata=plot_metadata,
+    )
     print(f"Saved analysis figure to {Path(figure_output).expanduser().resolve()}")
 
 

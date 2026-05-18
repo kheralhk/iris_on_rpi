@@ -1,8 +1,8 @@
 # mask_occlusion_tests.py
 
 from argparse import ArgumentParser
+import os
 from pathlib import Path
-import random
 import sys
 
 import cv2 as cv
@@ -14,26 +14,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset_loaders import load_dataset, resolve_dataset
+from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
 from filters import filters
 from iris import (
     IrisClassifier,
+    build_valid_source_mask,
+    clean_component_mask,
     get_iris_band,
     get_segmentation_backend_name,
     hamming_distances,
-    predict_annulus_mask,
     predict_unet_masks,
 )
 
-try:
-    from segmentation_geometry import build_valid_source_mask, clean_component_mask, pupil_mask_from_annulus
-except ImportError:
-    build_valid_source_mask = None
-    clean_component_mask = None
-    pupil_mask_from_annulus = None
-
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "mask_occlusion_tests"
+
+
+def add_figure_metadata(figure, metadata):
+    if not metadata:
+        return
+    text = " | ".join(f"{key}={value}" for key, value in metadata.items() if value is not None)
+    if text:
+        figure.text(0.01, 0.01, text, ha="left", va="bottom", fontsize=7, family="monospace", wrap=True)
 
 
 def load_image(path):
@@ -52,106 +54,37 @@ def segment_image(image):
 
 
 def get_source_debug(image):
-    if get_segmentation_backend_name() == "wahet":
-        raise RuntimeError("Wahet backend does not expose source segmentation masks for overlay export.")
-    if clean_component_mask is None:
-        raise RuntimeError("Source overlays require segmentation geometry helpers.")
-    try:
-        gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
-        if build_valid_source_mask is None:
-            raise RuntimeError("Source overlays require segmentation geometry helpers.")
-        iris_mask = clean_component_mask(iris_mask)
-        pupil_mask = clean_component_mask(pupil_mask)
-        eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
-        if np.any(eyelash_mask):
-            eyelash_mask = cv.dilate(
-                eyelash_mask,
-                cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
-                iterations=1,
-            )
-        valid_mask = build_valid_source_mask(
-            iris_mask,
-            pupil_mask,
+    gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
+    iris_mask = clean_component_mask(iris_mask)
+    pupil_mask = clean_component_mask(pupil_mask)
+    eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
+    if np.any(eyelash_mask):
+        eyelash_mask = cv.dilate(
             eyelash_mask,
-            source_image=gray,
-            oversat_threshold=254,
+            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
         )
-        annulus = ((iris_mask > 0) & ~(pupil_mask > 0))
-        valid = valid_mask > 0
-        excluded = annulus & ~valid
-        return {
-            "gray": gray,
-            "annulus": annulus.astype(np.uint8) * 255,
-            "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
-            "excluded": excluded.astype(np.uint8) * 255,
-            "valid": valid.astype(np.uint8) * 255,
-            "base_title": "Original Eye Image",
-            "overlay_title": "Source Mask Overlay",
-            "valid_title": "Valid Iris Area",
-            "excluded_title": "Excluded Iris Area",
-        }
-    except RuntimeError as exc:
-        if "Unexpected multiclass segmentation output shape" not in str(exc):
-            raise
-        if pupil_mask_from_annulus is None:
-            raise RuntimeError("Annulus overlays require segmentation geometry helpers.")
-        gray, annulus_mask = predict_annulus_mask(image)
-        annulus_mask = clean_component_mask(annulus_mask)
-        try:
-            pupil_mask = pupil_mask_from_annulus(annulus_mask)
-        except Exception:
-            pupil_mask = np.zeros_like(annulus_mask, dtype=np.uint8)
-        valid = annulus_mask > 0
-        excluded = np.zeros_like(valid, dtype=bool)
-        return {
-            "gray": gray,
-            "annulus": annulus_mask.astype(np.uint8) * 255,
-            "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
-            "excluded": excluded.astype(np.uint8) * 255,
-            "valid": valid.astype(np.uint8) * 255,
-            "base_title": "Original Eye Image",
-            "overlay_title": "Annulus Mask Overlay",
-            "valid_title": "Annulus Area",
-            "excluded_title": "Excluded Area",
-        }
-
-def sample_dataset(
-    images,
-    labels,
-    image_names,
-    max_samples=None,
-    max_identities=None,
-    max_images_per_identity=None,
-    seed=0,
-):
-    if max_samples is None and max_identities is None and max_images_per_identity is None:
-        return images, labels, image_names
-
-    rng = random.Random(seed)
-    label_to_indices = {}
-    for index, label in enumerate(labels):
-        label_to_indices.setdefault(label, []).append(index)
-
-    selected_labels = list(label_to_indices.keys())
-    if max_identities is not None and max_identities < len(selected_labels):
-        selected_labels = rng.sample(selected_labels, max_identities)
-
-    selected_indices = []
-    for label in selected_labels:
-        indices = list(label_to_indices[label])
-        if max_images_per_identity is not None and max_images_per_identity < len(indices):
-            indices = rng.sample(indices, max_images_per_identity)
-        selected_indices.extend(indices)
-
-    if max_samples is not None and max_samples < len(selected_indices):
-        selected_indices = rng.sample(selected_indices, max_samples)
-
-    selected_indices.sort()
-    sampled_images = [images[index] for index in selected_indices]
-    sampled_labels = labels[selected_indices]
-    sampled_names = image_names[selected_indices]
-    return sampled_images, sampled_labels, sampled_names
-
+    valid_mask = build_valid_source_mask(
+        iris_mask,
+        pupil_mask,
+        eyelash_mask,
+        source_image=gray,
+        oversat_threshold=254,
+    )
+    annulus = ((iris_mask > 0) & ~(pupil_mask > 0))
+    valid = valid_mask > 0
+    excluded = annulus & ~valid
+    return {
+        "gray": gray,
+        "annulus": annulus.astype(np.uint8) * 255,
+        "pupil": (pupil_mask > 0).astype(np.uint8) * 255,
+        "excluded": excluded.astype(np.uint8) * 255,
+        "valid": valid.astype(np.uint8) * 255,
+        "base_title": "Original Eye Image",
+        "overlay_title": "Source Mask Overlay",
+        "valid_title": "Valid Iris Area",
+        "excluded_title": "Excluded Iris Area",
+    }
 
 def build_enlarged_mask(mask, kernel_size, iterations):
     if kernel_size < 1 or kernel_size % 2 == 0:
@@ -189,8 +122,6 @@ def compare_with_details(classifier, iris_ref, mask_ref, iris_probe, mask_probe,
     ref_code, ref_code_mask, _ = classifier.get_iris_code(iris_ref, mask_ref)
     ref_code = np.asarray(ref_code, dtype=bool)
     ref_code_mask = np.asarray(ref_code_mask, dtype=bool)
-    bit_weights = classifier.get_bit_weights(iris_ref.shape)
-
     if rotation is None or rotation <= 1:
         offsets = np.array([0], dtype=np.int64)
         probe_codes, probe_masks, _ = classifier.get_iris_codes(iris_probe, mask_probe, offsets=offsets)
@@ -201,7 +132,7 @@ def compare_with_details(classifier, iris_ref, mask_ref, iris_probe, mask_probe,
     probe_codes = np.asarray(probe_codes, dtype=bool)
     probe_masks = np.asarray(probe_masks, dtype=bool)
 
-    scores = hamming_distances(probe_codes, ref_code, probe_masks, ref_code_mask, weights=bit_weights)
+    scores = hamming_distances(probe_codes, ref_code, probe_masks, ref_code_mask)
     overlap = np.sum(np.bitwise_and(probe_masks, ref_code_mask), axis=1)
 
     best_index = int(np.argmin(scores))
@@ -251,7 +182,7 @@ def build_source_mask_overlay(source_debug):
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
-def save_source_overlay_preview(output_path, source_debug):
+def save_source_overlay_preview(output_path, source_debug, metadata=None):
     overlay = build_source_mask_overlay(source_debug)
     figure, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.ravel()
@@ -276,15 +207,24 @@ def save_source_overlay_preview(output_path, source_debug):
         "Overlay colors: green = valid segmentation, purple = excluded area, black = pupil (if available)",
         fontsize=12,
     )
-    figure.tight_layout()
+    add_figure_metadata(figure, metadata or {})
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
 
-def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations):
+def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations, metadata=None):
     source_debug = get_source_debug(raw_image)
-    save_source_overlay_preview(output_path, source_debug)
+    plot_metadata = {
+        "kernel_size": kernel_size,
+        "iterations": iterations,
+        "backend": get_segmentation_backend_name(),
+        "seg_path": os.environ.get("SEG_PATH"),
+    }
+    if metadata:
+        plot_metadata.update(metadata)
+    save_source_overlay_preview(output_path, source_debug, metadata=plot_metadata)
 
 
 def run_single(args):
@@ -294,7 +234,21 @@ def run_single(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = image_path.stem
     overlay_path = output_dir / f"{stem}_{args.output_name}.png"
-    save_overlay_preview(overlay_path, image, None, None, args.kernel_size, args.iterations)
+    save_overlay_preview(
+        overlay_path,
+        image,
+        None,
+        None,
+        args.kernel_size,
+        args.iterations,
+        metadata={
+            "command": "single",
+            "image": image_path.name,
+            "output_name": args.output_name,
+            "rotation": args.rotation,
+            "fill_mode": args.fill_mode,
+        },
+    )
 
     try:
         iris_band, iris_mask = segment_image(image)
@@ -376,12 +330,29 @@ def run_multiple(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for index, image in enumerate(images, start=1):
-        if index == 1 or index % 10 == 0 or index == len(images):
+        if index == 1 or index % 100 == 0 or index == len(images):
             print(f"Segmenting samples: {index}/{len(images)}")
         name = Path(str(image_names[index - 1])).stem
         overlay_path = output_dir / f"{name}_{args.output_name}.png"
         try:
-            save_overlay_preview(overlay_path, image, None, None, args.kernel_size, args.iterations)
+            save_overlay_preview(
+                overlay_path,
+                image,
+                None,
+                None,
+                args.kernel_size,
+                args.iterations,
+                metadata={
+                    "command": "multiple",
+                    "dataset": dataset_format,
+                    "source": image_names[index - 1],
+                    "output_name": args.output_name,
+                    "max_samples": args.max_samples,
+                    "max_identities": args.max_identities,
+                    "max_images_per_identity": args.max_images_per_identity,
+                    "seed": args.seed,
+                },
+            )
         except Exception:
             skipped.append(str(image_names[index - 1]))
             continue
@@ -442,7 +413,7 @@ def build_parser():
     multiple.add_argument(
         "--dataset-format",
         default="casia-v3-interval",
-        choices=["auto", "casia-v1", "casia-v3-interval", "casia-v4-interval", "casia-v3-lamp", "casia-v3-twins", "ubiris-v2", "iitd", "mmu", "mmu2"],
+        choices=DATASET_CHOICES,
         help="Dataset folder layout to load.",
     )
     multiple.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
@@ -471,6 +442,7 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    print(f"Filters in use: {len(filters)}")
     args.func(args)
 
 

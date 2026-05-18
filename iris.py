@@ -3,13 +3,322 @@
 import cv2 as cv
 import numpy as np
 import os
-import subprocess
-import tempfile
+from dataclasses import dataclass
 from profiling import timeit
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
-from segmentation_geometry import annulus_mask_to_band, semantic_masks_to_band, DEFAULT_BAND_SHAPE
 PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_BAND_SHAPE = (64, 512)
+DEFAULT_INVALID_DILATION_KERNEL = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_KERNEL", 1)))
+DEFAULT_INVALID_DILATION_ITERATIONS = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_ITERATIONS", 1)))
+
+
+@dataclass(frozen=True)
+class EllipseBoundary:
+    center_x: float
+    center_y: float
+    axis_x: float
+    axis_y: float
+    angle_radians: float
+
+    def sample(self, theta):
+        theta = np.asarray(theta, dtype=np.float32)
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+        local_x = self.axis_x * cos_theta
+        local_y = self.axis_y * sin_theta
+        cos_angle = np.cos(self.angle_radians)
+        sin_angle = np.sin(self.angle_radians)
+        x = self.center_x + local_x * cos_angle - local_y * sin_angle
+        y = self.center_y + local_x * sin_angle + local_y * cos_angle
+        return x, y
+
+
+@dataclass(frozen=True)
+class PolarBoundary:
+    center_x: float
+    center_y: float
+    radii: np.ndarray
+
+    def sample(self, theta):
+        theta = np.asarray(theta, dtype=np.float32)
+        tau = 2.0 * np.pi
+        wrapped = np.mod(theta, tau)
+        base_theta = np.linspace(0.0, tau, len(self.radii), endpoint=False, dtype=np.float32)
+        extended_theta = np.concatenate((base_theta, [tau]), axis=0)
+        extended_radii = np.concatenate((self.radii, [self.radii[0]]), axis=0)
+        radii = np.interp(wrapped, extended_theta, extended_radii)
+        x = self.center_x + radii * np.cos(wrapped)
+        y = self.center_y + radii * np.sin(wrapped)
+        return x, y
+
+
+def _largest_component(mask):
+    mask = np.asarray(mask, dtype=np.uint8)
+    if mask.ndim != 2:
+        raise ValueError("Expected a 2D mask.")
+    if not np.any(mask):
+        return mask
+    num_labels, labels, stats, _ = cv.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+    areas = stats[1:, cv.CC_STAT_AREA]
+    largest = 1 + int(np.argmax(areas))
+    return (labels == largest).astype(np.uint8)
+
+
+def clean_component_mask(mask, kernel_size=5):
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    if not np.any(mask):
+        return mask
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    closed = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
+    opened = cv.morphologyEx(closed, cv.MORPH_OPEN, kernel)
+    return _largest_component(opened)
+
+
+def fit_boundary_from_mask(mask, prefer_ellipse=True):
+    component = clean_component_mask(mask)
+    if not np.any(component):
+        raise ValueError("Cannot fit a boundary to an empty mask.")
+
+    contours, _ = cv.findContours(component, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    if not contours:
+        raise ValueError("Failed to extract contours from mask.")
+    contour = max(contours, key=cv.contourArea)
+
+    if prefer_ellipse and len(contour) >= 5:
+        (center_x, center_y), (diameter_x, diameter_y), angle_degrees = cv.fitEllipse(contour)
+        return EllipseBoundary(
+            center_x=float(center_x),
+            center_y=float(center_y),
+            axis_x=max(float(diameter_x) / 2.0, 1.0),
+            axis_y=max(float(diameter_y) / 2.0, 1.0),
+            angle_radians=np.deg2rad(angle_degrees),
+        )
+
+    (center_x, center_y), radius = cv.minEnclosingCircle(contour)
+    radius = max(float(radius), 1.0)
+    return EllipseBoundary(
+        center_x=float(center_x),
+        center_y=float(center_y),
+        axis_x=radius,
+        axis_y=radius,
+        angle_radians=0.0,
+    )
+
+
+def _periodic_smooth(values, kernel_size):
+    kernel_size = max(int(kernel_size), 1)
+    if kernel_size <= 1:
+        return values.astype(np.float32)
+    kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
+    pad = kernel_size // 2
+    extended = np.concatenate((values[-pad:], values, values[:pad]), axis=0)
+    return np.convolve(extended, kernel, mode="same")[pad : pad + len(values)].astype(np.float32)
+
+
+def fit_polar_boundary_from_mask(mask, center, num_angles=DEFAULT_BAND_SHAPE[1], smooth_kernel=9, fallback_to_ellipse=True):
+    component = clean_component_mask(mask)
+    if not np.any(component):
+        raise ValueError("Cannot fit a boundary to an empty mask.")
+
+    contours, _ = cv.findContours(component, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    if not contours:
+        raise ValueError("Failed to extract contours from mask.")
+    contour = max(contours, key=cv.contourArea).reshape(-1, 2).astype(np.float32)
+
+    center_x, center_y = center
+    dx = contour[:, 0] - center_x
+    dy = contour[:, 1] - center_y
+    angles = np.mod(np.arctan2(dy, dx), 2.0 * np.pi)
+    radii = np.hypot(dx, dy)
+
+    angle_to_radius = np.full(num_angles, np.nan, dtype=np.float32)
+    angle_indices = np.floor(angles / (2.0 * np.pi) * num_angles).astype(np.int32) % num_angles
+    for index, radius in zip(angle_indices, radii):
+        if np.isnan(angle_to_radius[index]) or radius > angle_to_radius[index]:
+            angle_to_radius[index] = radius
+
+    valid = ~np.isnan(angle_to_radius)
+    if valid.sum() < max(num_angles // 4, 16):
+        if not fallback_to_ellipse:
+            raise ValueError("Not enough contour coverage to fit a polar boundary.")
+        ellipse = fit_boundary_from_mask(component, prefer_ellipse=True)
+        theta = np.linspace(0.0, 2.0 * np.pi, num_angles, endpoint=False, dtype=np.float32)
+        sample_x, sample_y = ellipse.sample(theta)
+        radii = np.hypot(sample_x - center_x, sample_y - center_y).astype(np.float32)
+        return PolarBoundary(center_x=float(center_x), center_y=float(center_y), radii=radii)
+
+    valid_indices = np.flatnonzero(valid)
+    extended_x = np.concatenate(
+        (valid_indices.astype(np.float32) - num_angles, valid_indices.astype(np.float32), valid_indices.astype(np.float32) + num_angles)
+    )
+    extended_y = np.concatenate((angle_to_radius[valid_indices], angle_to_radius[valid_indices], angle_to_radius[valid_indices]))
+    filled = np.interp(np.arange(num_angles, dtype=np.float32), extended_x, extended_y)
+    return PolarBoundary(center_x=float(center_x), center_y=float(center_y), radii=_periodic_smooth(filled, smooth_kernel))
+
+
+def dilate_invalid_region(valid_mask, support_mask, kernel_size=DEFAULT_INVALID_DILATION_KERNEL, iterations=DEFAULT_INVALID_DILATION_ITERATIONS):
+    kernel_size = max(int(kernel_size), 1)
+    iterations = max(int(iterations), 1)
+    valid_bool = np.asarray(valid_mask) > 0
+    support_bool = np.asarray(support_mask) > 0
+    invalid_inside_support = support_bool & ~valid_bool
+    if not np.any(invalid_inside_support):
+        return valid_bool.astype(np.uint8) * 255
+
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    dilated_invalid = cv.dilate(invalid_inside_support.astype(np.uint8), kernel, iterations=iterations) > 0
+    dilated_valid = support_bool & ~dilated_invalid
+    return dilated_valid.astype(np.uint8) * 255
+
+
+def build_valid_source_mask(
+    iris_mask,
+    pupil_mask,
+    occlusion_mask=None,
+    source_image=None,
+    oversat_threshold=254,
+    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
+    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
+):
+    iris_mask = clean_component_mask(iris_mask)
+    pupil_mask = clean_component_mask(pupil_mask)
+    annulus_mask = iris_mask.astype(bool) & ~pupil_mask.astype(bool)
+    valid = annulus_mask.copy()
+    if occlusion_mask is not None:
+        valid &= ~(np.asarray(occlusion_mask) > 0)
+    if source_image is not None:
+        valid &= np.asarray(source_image) < oversat_threshold
+    return dilate_invalid_region(
+        valid.astype(np.uint8) * 255,
+        annulus_mask.astype(np.uint8) * 255,
+        kernel_size=invalid_dilation_kernel,
+        iterations=invalid_dilation_iterations,
+    )
+
+
+def normalize_iris_from_boundaries(image, pupil_boundary, iris_boundary, valid_source_mask, band_shape=DEFAULT_BAND_SHAPE):
+    if image.ndim != 2:
+        raise ValueError("Expected a grayscale source image.")
+
+    band_height, band_width = band_shape
+    theta = np.linspace(0.0, 2.0 * np.pi, band_width, endpoint=False, dtype=np.float32)
+    radial = np.linspace(0.0, 1.0, band_height, dtype=np.float32)[:, None]
+
+    pupil_x, pupil_y = pupil_boundary.sample(theta)
+    iris_x, iris_y = iris_boundary.sample(theta)
+    map_x = (1.0 - radial) * pupil_x[None, :] + radial * iris_x[None, :]
+    map_y = (1.0 - radial) * pupil_y[None, :] + radial * iris_y[None, :]
+
+    band = cv.remap(
+        image.astype(np.float32),
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_REFLECT_101,
+    )
+    sampled_mask = cv.remap(
+        valid_source_mask.astype(np.uint8),
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv.INTER_NEAREST,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return np.clip(band, 0, 255).astype(np.uint8), (sampled_mask > 0).astype(np.uint8) * 255
+
+
+def semantic_masks_to_band(
+    image,
+    iris_mask,
+    pupil_mask,
+    occlusion_mask=None,
+    band_shape=DEFAULT_BAND_SHAPE,
+    prefer_ellipse=True,
+    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
+    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
+):
+    if occlusion_mask is not None:
+        occlusion_mask = clean_component_mask(occlusion_mask, kernel_size=3)
+        occlusion_mask = cv.dilate(
+            occlusion_mask,
+            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+
+    valid_source_mask = build_valid_source_mask(
+        iris_mask,
+        pupil_mask,
+        occlusion_mask,
+        source_image=image,
+        oversat_threshold=254,
+        invalid_dilation_kernel=invalid_dilation_kernel,
+        invalid_dilation_iterations=invalid_dilation_iterations,
+    )
+    pupil_ellipse = fit_boundary_from_mask(pupil_mask, prefer_ellipse=prefer_ellipse)
+    center = (pupil_ellipse.center_x, pupil_ellipse.center_y)
+    pupil_boundary = fit_polar_boundary_from_mask(pupil_mask, center=center, num_angles=band_shape[1], smooth_kernel=7)
+    iris_boundary = fit_polar_boundary_from_mask(iris_mask, center=center, num_angles=band_shape[1], smooth_kernel=17)
+
+    if np.mean(iris_boundary.radii) <= np.mean(pupil_boundary.radii):
+        raise ValueError("Iris boundary must be larger than pupil boundary.")
+
+    return normalize_iris_from_boundaries(image, pupil_boundary, iris_boundary, valid_source_mask, band_shape=band_shape)
+
+
+def _infer_pupil_mask_from_binary_iris(iris_mask):
+    iris_component = clean_component_mask(iris_mask)
+    if not np.any(iris_component):
+        raise ValueError("Cannot infer pupil from an empty binary iris mask.")
+
+    contours, hierarchy = cv.findContours(iris_component, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
+    if contours and hierarchy is not None:
+        hierarchy = hierarchy[0]
+        child_candidates = []
+        for index, contour in enumerate(contours):
+            parent = hierarchy[index][3]
+            if parent < 0:
+                continue
+            area = cv.contourArea(contour)
+            if area > 0:
+                child_candidates.append((area, contour))
+        if child_candidates:
+            _, pupil_contour = max(child_candidates, key=lambda item: item[0])
+            pupil_mask = np.zeros_like(iris_component, dtype=np.uint8)
+            cv.drawContours(pupil_mask, [pupil_contour], -1, 1, thickness=-1)
+            return clean_component_mask(pupil_mask)
+
+    iris_boundary = fit_boundary_from_mask(iris_component, prefer_ellipse=True)
+    radius = max(2, int(round(0.35 * min(iris_boundary.axis_x, iris_boundary.axis_y))))
+    pupil_mask = np.zeros_like(iris_component, dtype=np.uint8)
+    center = (int(round(iris_boundary.center_x)), int(round(iris_boundary.center_y)))
+    cv.circle(pupil_mask, center, radius, 1, thickness=-1)
+    return pupil_mask
+
+
+def binary_iris_mask_to_band(
+    image,
+    iris_or_annulus_mask,
+    band_shape=DEFAULT_BAND_SHAPE,
+    prefer_ellipse=True,
+    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
+    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
+):
+    annulus_mask = clean_component_mask(iris_or_annulus_mask)
+    pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
+    iris_mask = clean_component_mask((annulus_mask.astype(bool) | pupil_mask.astype(bool)).astype(np.uint8))
+    return semantic_masks_to_band(
+        image,
+        iris_mask=iris_mask,
+        pupil_mask=pupil_mask,
+        occlusion_mask=None,
+        band_shape=band_shape,
+        prefer_ellipse=prefer_ellipse,
+        invalid_dilation_kernel=invalid_dilation_kernel,
+        invalid_dilation_iterations=invalid_dilation_iterations,
+    )
 DEFAULT_SEGMENTATION_BACKEND = os.environ.get(
     "SEG_BACKEND",
     os.environ.get(
@@ -43,7 +352,6 @@ def _resolve_segmentation_model_path():
         return (PROJECT_ROOT / path).resolve()
 
     default_candidates = [
-        PROJECT_ROOT / "models" / "iris_semseg_upp_scse_mobilenetv2.onnx",
         PROJECT_ROOT / "models" / "upp_scse_mobilenetv2.onnx",
         PROJECT_ROOT / "models" / "mysegmenter.onnx",
     ]
@@ -53,28 +361,10 @@ def _resolve_segmentation_model_path():
     return default_candidates[0]
 
 
-def _resolve_wahet_binary_path():
-    configured = os.environ.get(
-        "WAHET_PATH",
-        os.environ.get("IRIS_WAHET_PATH"),
-    )
-    if configured is not None:
-        path = Path(configured).expanduser()
-        if path.is_absolute():
-            return path
-        cwd_candidate = path.resolve()
-        if cwd_candidate.exists():
-            return cwd_candidate
-        return (PROJECT_ROOT / path).resolve()
-    return PROJECT_ROOT / "wahet"
-
-
 def _normalize_segmentation_backend_name(name):
     backend_name = str(name).strip().lower()
-    if backend_name in {"onnx", "model", "custom", "unet", "annulus"}:
+    if backend_name in {"onnx", "model", "custom", "unet"}:
         return "onnx"
-    if backend_name == "wahet":
-        return "wahet"
     raise ValueError(f"Unsupported segmentation backend: {name}")
 
 
@@ -83,7 +373,6 @@ def get_segmentation_backend_name(backend=None):
 
 
 UNET_ONNX_PATH = _resolve_segmentation_model_path()
-WAHET_BINARY = _resolve_wahet_binary_path()
 UNET_INPUT_SIZE = (
     int(os.environ.get("IRIS_UNET_INPUT_WIDTH", 480)),
     int(os.environ.get("IRIS_UNET_INPUT_HEIGHT", 640)),
@@ -93,50 +382,32 @@ UNET_BAND_SHAPE = (
     int(os.environ.get("IRIS_UNET_BAND_HEIGHT", DEFAULT_BAND_SHAPE[0])),
     int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
 )
-OUTER_IRIS_WEIGHT = 0.25
-VERTICAL_PAD_MODE = os.environ.get("IRIS_VERTICAL_PAD_MODE", "reflect").strip().lower()
-MASKED_WINDOW_POLICY = os.environ.get("IRIS_MASKED_WINDOW_POLICY", "strict").strip().lower()
-MASK_FILL_MODE = os.environ.get("IRIS_MASK_FILL_MODE", "zero").strip().lower()
 _UNET_NET = None
 
 @timeit
-def hamming_distance(a,b,mask1, mask2, weights=None):
+def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
     mask = np.bitwise_and(mask1, mask2)
-    if weights is None:
-        total = np.sum(np.bitwise_and(diff, mask))
-        n = np.sum(mask)
-    else:
-        weights = np.asarray(weights, dtype=np.float32)
-        weighted_mask = mask.astype(np.float32) * weights
-        total = np.sum(np.bitwise_and(diff, mask).astype(np.float32) * weights)
-        n = np.sum(weighted_mask)
+    total = np.sum(np.bitwise_and(diff, mask))
+    n = np.sum(mask)
     if n == 0:
         return 2.0
     return total/n
 
 @timeit
-def hamming_distances(a, b, masks_a, mask_b, weights=None):
+def hamming_distances(a, b, masks_a, mask_b):
     diff = np.bitwise_xor(a, b)
     mask = np.bitwise_and(masks_a, mask_b)
     scores = np.full(a.shape[0], 2.0, dtype=np.float64)
-    if weights is None:
-        total = np.sum(np.bitwise_and(diff, mask), axis=1)
-        n = np.sum(mask, axis=1)
-    else:
-        weights = np.asarray(weights, dtype=np.float32)
-        if weights.ndim == 1:
-            weights = weights[None, :]
-        weighted_mask = mask.astype(np.float32) * weights
-        total = np.sum(np.bitwise_and(diff, mask).astype(np.float32) * weights, axis=1)
-        n = np.sum(weighted_mask, axis=1)
+    total = np.sum(np.bitwise_and(diff, mask), axis=1)
+    n = np.sum(mask, axis=1)
     valid = n > 0
     scores[valid] = total[valid] / n[valid]
     return scores
 
 
 @timeit
-def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
+def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma, rotate_envelope=False):
     """Create a complex Gabor kernel."""
     y_size, x_size = size
     x_half_size = x_size // 2
@@ -145,13 +416,12 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma):
                        np.linspace(-x_half_size, x_half_size, x_size))
     
     x_theta = x * np.cos(theta) + y * np.sin(theta)
-    # _x_theta = x * np.cos(0) + y * np.sin(0)
-    _x_theta = x
-    # _y_theta = -x * np.sin(0) + y * np.cos(0)
-    _y_theta = y
+    y_theta = -x * np.sin(theta) + y * np.cos(theta)
 
-    # gaussian = np.exp(-0.5 * (_x_theta**2 + (gamma**2) * _y_theta**2) / sigma**2)
-    gaussian = np.exp(-0.5 * (x**2 + (gamma**2) * y**2) / sigma**2)
+    if rotate_envelope:
+        gaussian = np.exp(-0.5 * (x_theta**2 + (gamma**2) * y_theta**2) / sigma**2)
+    else:
+        gaussian = np.exp(-0.5 * (x**2 + (gamma**2) * y**2) / sigma**2)
 
     complex_sinusoid = np.exp(1j * (2 * np.pi * x_theta / lambd + psi))
 
@@ -171,76 +441,6 @@ def complex_to_bits(z, mask_bit_list):
     return result, mask_bits
 
 
-def _pad_iris_vertically(iris, pad_top, pad_bottom):
-    if VERTICAL_PAD_MODE in {"reflect", "mirror"}:
-        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="reflect")
-    if VERTICAL_PAD_MODE in {"duplicate", "edge", "replicate"}:
-        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="edge")
-    if VERTICAL_PAD_MODE in {"circular", "wrap"}:
-        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="wrap")
-    if VERTICAL_PAD_MODE in {"zero", "constant"}:
-        return np.pad(iris, ((pad_top, pad_bottom), (0, 0)), mode="constant")
-    raise ValueError(
-        "Unsupported IRIS_VERTICAL_PAD_MODE. Use one of: reflect, duplicate, circular, zero."
-    )
-
-
-def _fill_masked_pixels_in_band(iris, mask, mode):
-    mode = mode.strip().lower()
-    if mode in {"zero", "constant"}:
-        filled = iris.copy()
-        filled[mask != 255] = 0
-        return filled
-
-    valid = mask == 255
-    filled = iris.copy()
-    height, width = iris.shape
-
-    for x in range(width):
-        col = filled[:, x]
-        valid_col = valid[:, x]
-        invalid_rows = np.flatnonzero(~valid_col)
-        if invalid_rows.size == 0:
-            continue
-
-        valid_rows = np.flatnonzero(valid_col)
-        if valid_rows.size == 0:
-            col[:] = 0
-            filled[:, x] = col
-            continue
-
-        first_valid = int(valid_rows[0])
-        last_valid = int(valid_rows[-1])
-
-        if mode in {"duplicate", "edge", "replicate"}:
-            for y in invalid_rows:
-                nearest = valid_rows[np.argmin(np.abs(valid_rows - y))]
-                col[y] = col[nearest]
-            filled[:, x] = col
-            continue
-
-        if mode in {"mirror", "reflect"}:
-            for y in invalid_rows:
-                if y < first_valid:
-                    reflected = first_valid + (first_valid - y - 1)
-                    reflected = min(reflected, last_valid)
-                    col[y] = col[reflected]
-                elif y > last_valid:
-                    reflected = last_valid - (y - last_valid - 1)
-                    reflected = max(reflected, first_valid)
-                    col[y] = col[reflected]
-                else:
-                    nearest = valid_rows[np.argmin(np.abs(valid_rows - y))]
-                    col[y] = col[nearest]
-            filled[:, x] = col
-            continue
-
-        raise ValueError(
-            "Unsupported IRIS_MASK_FILL_MODE. Use one of: zero, duplicate, mirror."
-        )
-
-    return filled
-
 def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_positions, mask=None):
     x_stride, y_stride = stride
     iris_h, iris_w = iris.shape
@@ -259,57 +459,58 @@ def _apply_filter_grid_batch(iris, filter_real, filter_imag, stride, start_posit
     x_right = filter_w - x_half - 1
     num_y = iris_h // y_stride
     y_positions = y_starts[0] + y_stride * np.arange(num_y)
-    extra_top = max(0, -int(y_positions.min()))
-    extra_bottom = max(0, int(y_positions.max()) - (iris_h - 1))
+    window_tops = y_positions - y_half
+    valid_y = (window_tops >= 0) & ((window_tops + filter_h) <= iris_h)
 
-    iris_for_filtering = iris
-    if mask is not None and MASKED_WINDOW_POLICY == "fill":
-        iris_for_filtering = _fill_masked_pixels_in_band(iris, mask, MASK_FILL_MODE)
+    result_grid = np.zeros((num_y, len(start_positions), num_x), dtype=np.complex64)
+    mask_grid = np.zeros((num_y, len(start_positions), num_x), dtype=bool)
+    if not np.any(valid_y) or filter_h > iris_h:
+        return (
+            result_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+            mask_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+        )
 
-    padded_iris = _pad_iris_vertically(iris_for_filtering, y_half + extra_top, y_bottom + extra_bottom)
     wrapped_iris = np.concatenate(
         (
-            padded_iris[:, -x_half:] if x_half else padded_iris[:, :0],
-            padded_iris,
-            padded_iris[:, :x_right] if x_right else padded_iris[:, :0],
+            iris[:, -x_half:] if x_half else iris[:, :0],
+            iris,
+            iris[:, :x_right] if x_right else iris[:, :0],
         ),
         axis=1,
     )
 
     iris_windows = sliding_window_view(wrapped_iris, (filter_h, filter_w))
-    sampled_rows = iris_windows[y_positions + extra_top]
+    sampled_rows = iris_windows[window_tops[valid_y]]
     x_positions = (x_starts[:, None] + x_stride * np.arange(num_x)) % iris_w
     sampled_iris = sampled_rows[:, x_positions, :, :]
 
     result_real = np.einsum("yoxij,ij->yox", sampled_iris, filter_real, optimize=True)
     result_imag = np.einsum("yoxij,ij->yox", sampled_iris, filter_imag, optimize=True)
-    results = (result_real + result_imag * 1j).transpose(1, 2, 0).reshape(len(start_positions), -1)
+    result_grid[valid_y] = result_real + result_imag * 1j
 
     if mask is None:
-        mask_bits = np.ones(results.shape, dtype=np.bool)
-        return results, mask_bits
+        mask_grid[valid_y] = True
+        return (
+            result_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+            mask_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+        )
 
-    padded_mask = np.pad(
-        mask,
-        ((y_half + extra_top, y_bottom + extra_bottom), (0, 0)),
-        mode="constant",
-    )
     wrapped_mask = np.concatenate(
         (
-            padded_mask[:, -x_half:] if x_half else padded_mask[:, :0],
-            padded_mask,
-            padded_mask[:, :x_right] if x_right else padded_mask[:, :0],
+            mask[:, -x_half:] if x_half else mask[:, :0],
+            mask,
+            mask[:, :x_right] if x_right else mask[:, :0],
         ),
         axis=1,
     )
     mask_windows = sliding_window_view(wrapped_mask, (filter_h, filter_w))
-    sampled_mask_rows = mask_windows[y_positions + extra_top]
+    sampled_mask_rows = mask_windows[window_tops[valid_y]]
     sampled_mask = sampled_mask_rows[:, x_positions, :, :]
-    if MASKED_WINDOW_POLICY == "fill":
-        mask_bits = np.any(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
-    else:
-        mask_bits = np.all(sampled_mask == 255, axis=(3, 4)).transpose(1, 2, 0).reshape(len(start_positions), -1)
-    return results, mask_bits
+    mask_grid[valid_y] = np.all(sampled_mask == 255, axis=(3, 4))
+    return (
+        result_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+        mask_grid.transpose(1, 2, 0).reshape(len(start_positions), -1),
+    )
 
 def _resolve_dnn_backend(name):
     mapping = {
@@ -399,62 +600,16 @@ def predict_unet_masks(img):
     return source_gray, iris_mask, pupil_mask, eyelash_mask
 
 
-def predict_annulus_mask(img):
+def predict_binary_iris_mask(img):
     source_gray, output = _forward_segmentation_model(img)
-    if output.ndim != 4:
-        raise RuntimeError(f"Unexpected annulus model output shape: {output.shape}")
+    if output.ndim != 4 or output.shape[1] != 1:
+        raise RuntimeError(f"Unexpected binary segmentation output shape: {output.shape}")
 
+    probability = _sigmoid_if_needed(output[0, 0])
     image_h, image_w = source_gray.shape
-    if output.shape[1] == 1:
-        annulus_prob = _sigmoid_if_needed(output[0, 0])
-    elif output.shape[1] == 2:
-        logits = output[0].astype(np.float32)
-        logits = logits - np.max(logits, axis=0, keepdims=True)
-        exp_logits = np.exp(logits)
-        annulus_prob = exp_logits[1] / np.sum(exp_logits, axis=0)
-    else:
-        raise RuntimeError(
-            f"Binary annulus model must output 1 or 2 channels, got {output.shape[1]}."
-        )
-
-    annulus_prob = cv.resize(annulus_prob, (image_w, image_h), interpolation=cv.INTER_LINEAR)
-    annulus_mask = annulus_prob >= UNET_THRESHOLD
-    return source_gray, annulus_mask
-
-
-@timeit
-def _segment_with_wahet(img):
-    if not WAHET_BINARY.exists():
-        raise FileNotFoundError(
-            f"Wahet executable not found at '{WAHET_BINARY}'. "
-            "Set WAHET_PATH or place the binary there."
-        )
-
-    with tempfile.TemporaryDirectory(prefix="wahet_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        input_path = temp_dir / "input.png"
-        output_path = temp_dir / "output.png"
-        mask_path = temp_dir / "mask.png"
-
-        if not cv.imwrite(str(input_path), img):
-            raise RuntimeError(f"Failed to write temporary wahet input to '{input_path}'.")
-
-        result = subprocess.run(
-            [str(WAHET_BINARY), "-i", str(input_path), "-o", str(output_path), "-m", str(mask_path)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.strip() if result.stderr else ""
-            stdout = result.stdout.strip() if result.stdout else ""
-            detail = stderr or stdout or "wahet exited with a non-zero status"
-            raise RuntimeError(f"Wahet segmentation failed: {detail}")
-
-        image = cv.imread(str(output_path), cv.IMREAD_GRAYSCALE)
-        mask = cv.imread(str(mask_path), cv.IMREAD_GRAYSCALE)
-        if image is None or mask is None:
-            raise RuntimeError("Wahet did not produce readable output image and mask.")
-        return image, mask
+    resized_probability = cv.resize(probability, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+    iris_mask = resized_probability >= UNET_THRESHOLD
+    return source_gray, iris_mask
 
 
 @timeit
@@ -463,25 +618,19 @@ def _segment_with_unet(img):
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
 
-    if output.shape[1] in {1, 2}:
+    if output.shape[1] == 1:
+        probability = _sigmoid_if_needed(output[0, 0])
         image_h, image_w = source_gray.shape
-        if output.shape[1] == 1:
-            annulus_prob = _sigmoid_if_needed(output[0, 0])
-        else:
-            logits = output[0].astype(np.float32)
-            logits = logits - np.max(logits, axis=0, keepdims=True)
-            exp_logits = np.exp(logits)
-            annulus_prob = exp_logits[1] / np.sum(exp_logits, axis=0)
-
-        annulus_prob = cv.resize(annulus_prob, (image_w, image_h), interpolation=cv.INTER_LINEAR)
-        annulus_mask = annulus_prob >= UNET_THRESHOLD
-        return annulus_mask_to_band(
+        resized_probability = cv.resize(probability, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+        return binary_iris_mask_to_band(
             source_gray,
-            annulus_mask=annulus_mask,
+            resized_probability >= UNET_THRESHOLD,
             band_shape=UNET_BAND_SHAPE,
             prefer_ellipse=True,
-            source_image_for_saturation=source_gray,
         )
+
+    if output.shape[1] < 3:
+        raise RuntimeError(f"Unexpected multiclass segmentation output shape: {output.shape}")
 
     probabilities = _sigmoid_if_needed(output[0])
     image_h, image_w = source_gray.shape
@@ -507,9 +656,7 @@ def _segment_with_unet(img):
 
 @timeit
 def get_iris_band(img, backend=None):
-    backend_name = get_segmentation_backend_name(backend)
-    if backend_name == "wahet":
-        return _segment_with_wahet(img)
+    get_segmentation_backend_name(backend)
     return _segment_with_unet(img)
 
 class IrisClassifier():
@@ -527,33 +674,6 @@ class IrisClassifier():
             imag_filter = imag_filter - np.mean(imag_filter)
             self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
-        self._bit_weight_cache = {}
-
-    def get_bit_weights(self, iris_shape):
-        iris_shape = tuple(int(v) for v in iris_shape)
-        cached = self._bit_weight_cache.get(iris_shape)
-        if cached is not None:
-            return cached
-
-        iris_h, iris_w = iris_shape
-        weight_chunks = []
-        for filter_settings in self._filter_settings:
-            x_stride, y_stride = filter_settings["stride"]
-            start_x, start_y = filter_settings["start_position"]
-            num_x = iris_w // x_stride
-            num_y = iris_h // y_stride
-            y_positions = start_y + y_stride * np.arange(num_y, dtype=np.float32)
-            normalized_radius = np.clip(y_positions / max(iris_h - 1, 1), 0.0, 1.0)
-            row_weights = 1.0 - (1.0 - OUTER_IRIS_WEIGHT) * normalized_radius
-            location_weights = np.tile(row_weights.astype(np.float32), num_x)
-            bit_weights = np.empty(location_weights.size * 2, dtype=np.float32)
-            bit_weights[0::2] = location_weights
-            bit_weights[1::2] = location_weights
-            weight_chunks.append(bit_weights)
-
-        weights = np.concatenate(weight_chunks, axis=0)
-        self._bit_weight_cache[iris_shape] = weights
-        return weights
 
     @timeit
     def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0):
@@ -612,11 +732,10 @@ class IrisClassifier():
     
     @timeit
     def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
-        bit_weights = self.get_bit_weights(iris.shape)
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
-            return (hamming_distance(bits, iris_code, mask, iris_code_mask, weights=bit_weights), 0)
+            return (hamming_distance(bits, iris_code, mask, iris_code_mask), 0)
         offsets = np.arange(rotation) - rotation // 2
         bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
-        scores = hamming_distances(bits, iris_code, masks, iris_code_mask, weights=bit_weights)
+        scores = hamming_distances(bits, iris_code, masks, iris_code_mask)
         return (np.min(scores), np.argmin(scores)-rotation//2)
