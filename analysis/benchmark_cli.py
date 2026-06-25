@@ -1,6 +1,8 @@
 # benchmark_cli
 
 from argparse import ArgumentParser
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -51,6 +53,14 @@ def load_image(path):
     if image is None:
         raise FileNotFoundError(f"Failed to load image '{image_path}'.")
     return image
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def segment_image(image):
@@ -253,6 +263,59 @@ def collect_database_images(database_images, database_dir, database_size):
             f"Find database needs {database_size} real images, but only found {len(paths)}."
         )
     return paths[:database_size]
+
+
+def database_cache_path(path):
+    cache_path = Path(path).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = DEFAULT_OUTPUT_DIR / cache_path
+    return cache_path.resolve()
+
+
+def database_cache_metadata(database_images, database_size, iris_engine, segmenter, filters_source):
+    return {
+        "version": 1,
+        "database_size": int(database_size),
+        "database_images": [str(path) for path in database_images],
+        "iris_engine": iris_engine,
+        "segmenter": segmenter,
+        "filters_source": str(Path(filters_source).expanduser().resolve()),
+        "filters_sha256": file_sha256(filters_source),
+    }
+
+
+def load_database_cache(cache_path, expected_metadata):
+    with np.load(cache_path, allow_pickle=False) as data:
+        cached_metadata = json.loads(str(data["metadata"].item()))
+        if cached_metadata != expected_metadata:
+            raise ValueError(
+                f"Database cache metadata does not match this run: {cache_path}. "
+                "Use --rebuild-database-cache or choose a different --database-cache."
+            )
+        return data["codes"].astype(bool, copy=False)
+
+
+def save_database_cache(cache_path, codes, metadata):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        codes=np.asarray(codes, dtype=bool),
+        metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+
+def load_or_build_database(classifier, database_images, segmenter_fn, metadata, cache_path=None, rebuild_cache=False):
+    if cache_path is not None:
+        cache_path = database_cache_path(cache_path)
+        if cache_path.exists() and not rebuild_cache:
+            print(f"Loading find database cache: {cache_path}")
+            return load_database_cache(cache_path, metadata)
+
+    codes = build_database(classifier, database_images, segmenter_fn)
+    if cache_path is not None:
+        print(f"Saving find database cache: {cache_path}")
+        save_database_cache(cache_path, codes, metadata)
+    return codes
 
 
 def enroll_operation(classifier, image, segmenter, profile=None):
@@ -503,6 +566,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--database-cache",
+        help=(
+            "Optional .npz cache for the find database iriscodes. "
+            "Relative paths are stored under analysis/output/benchmark_cli/."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-database-cache",
+        action="store_true",
+        help="Rebuild --database-cache even if it already exists.",
+    )
+    parser.add_argument(
         "--rotation",
         type=int,
         default=1,
@@ -589,10 +664,20 @@ def main():
     print(f"Rotation method: {args.rotation_method}")
     print(f"Rotation offsets: {','.join(str(int(offset)) for offset in offsets)}")
     classifier = classifier_class(selected_filters)
-    stored_database = build_database(
+    database_metadata = database_cache_metadata(
+        database_images,
+        args.database_size,
+        args.iris_engine,
+        args.segmenter,
+        filters_source,
+    )
+    stored_database = load_or_build_database(
         classifier,
         database_images,
         segmenter,
+        database_metadata,
+        args.database_cache,
+        args.rebuild_database_cache,
     )
     stored_template = stored_database[:, :1, :]
     profile = StepProfile()
@@ -663,6 +748,7 @@ def main():
             "compare_image": Path(args.compare_image).name,
             "database_source": args.database_dir or "explicit image list",
             "database_size": stored_database.shape[1],
+            "database_cache": args.database_cache,
             "rotation": args.rotation,
             "rotation_step": args.rotation_step,
             "rotation_method": args.rotation_method,
