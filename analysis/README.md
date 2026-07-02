@@ -53,6 +53,7 @@ Useful options:
 - `--gt-mask`: use ground-truth masks from generated GT manifests instead of the segmenter. Supported local GT-mask datasets are `casia-v3-interval`, `casia-v4-interval`, and `iitd`. The command fails if a selected dataset has no GT manifest. GT masks are not stored in this repository; the masks used for these experiments came from [IRISEG-EP, WaveLab / Hofbauer14b](https://www.wavelab.at/sources/Hofbauer14b/).
 - `--threshold`: evaluate a fixed Hamming-distance threshold in addition to EER.
 - `--rotation-step N`: test every `N`th offset inside the centered `--rotation` range. For example, `--rotation 21 --rotation-step 4` tests offsets `-8, -4, 0, 4, 8`.
+- `--max-img N`: cap the total number of sampled images after applying `--max-id` and `--max-img-per-id`.
 - `--parts N`: split each iriscode into `N` parts and use part-split average HD. This defaults to `--eliminate 0` and `--score hd`.
 - `--score hd`: use selected-part average Hamming distance.
 - `--score match-rotation`: classify by how many parts have matching best rotations.
@@ -74,12 +75,17 @@ Example:
   --max-img-per-id 10 \
   --rotation 71 \
   --filters ../filters.py \
-  --segmenter unet \
+  --segmenter unet-int8 \
+  --test probe \
   --target-fpr 0.001 0.0001 \
   --output-name subset_std_rot71
 ```
 
-The script summarizes EER, EER threshold, and TAR/TPR at each requested FAR/FPR target.
+The script summarizes EER, EER threshold, and TAR/TPR at each requested FAR/FPR target. Use `--test probe` for one gallery image per identity and all remaining sampled images as probes; omit it for all-pairs testing. Roll rotation is the default. Use `--rotation-method recompute` only when explicitly comparing against the older rotation implementation.
+
+`--max-img-per-id` is optional and defaults to 5. The count stays fixed, while the selected images vary with each run's seed so the reported standard deviation reflects different subsets rather than different subset sizes.
+
+Use `--radial-bands N --exclude-radial-bands B ...` to repeat a radial-band exclusion experiment. Band numbers are one-based, and band 1 is closest to the pupil. For example, `--radial-bands 5 --exclude-radial-bands 1 5` excludes the innermost and outermost bands from every run.
 
 ### `benchmark_cli.py`
 
@@ -96,18 +102,18 @@ Example:
   --rotation 71 \
   --filters ../filters.py \
   --iris-engine current \
-  --segmenter unet \
+  --segmenter unet-int8 \
   --output-name cli_runtime_rot71.png
 ```
 
-### `pairwise_iris_analysis.py`
+### `hamming_distance_distribution.py`
 
 Computes all pairwise scores for one dataset and plots mated/non-mated Hamming-distance distributions.
 
 Example:
 
 ```bash
-../.venv/bin/python pairwise_iris_analysis.py \
+../.venv/bin/python hamming_distance_distribution.py \
   --dataset casia-v4-interval \
   --output-name v4int_baseline_s70_rot21 \
   --rotation 21 \
@@ -121,6 +127,7 @@ Useful options:
 
 - `--dataset-path`: override the dataset folder while keeping `--dataset` as the dataset layout selector.
 - `--output-name`: name the generated distribution/ROC/EER figure.
+- `--show-thresholds`: add zero-false-accept and zero-false-reject threshold lines to the distribution plot. Threshold values are printed regardless.
 
 ### `compare_pipelines.py`
 

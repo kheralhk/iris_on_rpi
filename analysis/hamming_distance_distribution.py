@@ -1,4 +1,4 @@
-# pairwise_iris_analysis.py
+# hamming_distance_distribution.py
 
 from argparse import ArgumentParser
 from itertools import combinations
@@ -15,10 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 ANALYSIS_ROOT = Path(__file__).resolve().parent
-MATPLOTLIB_CONFIG_DIR = ANALYSIS_ROOT / "output" / "pairwise_iris_analysis" / "matplotlib"
+MATPLOTLIB_CONFIG_DIR = ANALYSIS_ROOT / "output" / "hamming_distance_distribution" / "matplotlib"
 MATPLOTLIB_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
-XDG_CACHE_DIR = ANALYSIS_ROOT / "output" / "pairwise_iris_analysis" / "cache"
+XDG_CACHE_DIR = ANALYSIS_ROOT / "output" / "hamming_distance_distribution" / "cache"
 XDG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("XDG_CACHE_HOME", str(XDG_CACHE_DIR))
 
@@ -36,7 +36,7 @@ import seaborn as sns
 
 
 DEFAULT_DATASET_FORMAT = "auto"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "pairwise_iris_analysis"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "hamming_distance_distribution"
 MATCHER_IRISCODE = "iriscode"
 
 
@@ -65,6 +65,20 @@ def build_wahet_band_getter():
     return get_wahet_band
 
 
+def build_myseg_band_getter():
+    def get_myseg_band(image, _image_name):
+        return get_iris_band(image, backend="myseg")
+
+    return get_myseg_band
+
+
+def build_unet_band_getter(segmenter="unet-int8"):
+    def get_unet_band(image, _image_name):
+        return get_iris_band(image, backend=segmenter)
+
+    return get_unet_band
+
+
 def add_figure_metadata(figure, metadata):
     if not metadata:
         return
@@ -82,7 +96,7 @@ def precompute_codes(
     band_getter=None,
     offsets=None,
     min_valid_iris_pixels=None,
-    rotation_method="recompute",
+    rotation_method="roll",
 ):
     if band_getter is None:
         band_getter = lambda image, _image_name: get_iris_band(image)
@@ -484,20 +498,19 @@ def plot_results(
     matcher=MATCHER_IRISCODE,
     metadata=None,
     scale="linear",
+    title="Hamming Distance Distribution",
 ):
     mated_scores = scores[same_class]
     non_mated_scores = scores[~same_class]
-    fpr = evaluation["fpr"]
-    distribution_title = "Hamming Distance Distribution"
     x_label = "Hamming Distance"
     x_limit = (0.0, 0.6)
 
     sns.set_theme(style="whitegrid")
-    figure, axes = plt.subplots(1, 2, figsize=(14, 6))
+    figure, axis = plt.subplots(figsize=(8, 6))
 
     if scale == "log":
         bins = np.linspace(x_limit[0], x_limit[1], 80)
-        axes[0].hist(
+        axis.hist(
             mated_scores,
             bins=bins,
             label="Mated",
@@ -505,7 +518,7 @@ def plot_results(
             alpha=0.45,
             log=True,
         )
-        axes[0].hist(
+        axis.hist(
             non_mated_scores,
             bins=bins,
             label="Non-Mated",
@@ -514,26 +527,37 @@ def plot_results(
             log=True,
         )
     else:
-        sns.kdeplot(mated_scores, ax=axes[0], label="Mated", color="#3b5bff", fill=True, alpha=0.55)
+        sns.kdeplot(mated_scores, ax=axis, label="Mated", color="#3b5bff", fill=True, alpha=0.55)
         sns.kdeplot(
             non_mated_scores,
-            ax=axes[0],
+            ax=axis,
             label="Non-Mated",
             color="#ff4d4f",
             fill=True,
             alpha=0.55,
         )
-    axes[0].set_title(distribution_title)
-    axes[0].set_xlabel(x_label)
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    eer_percent = f"{evaluation['eer'] * 100:.4f}".rstrip("0").rstrip(".")
+    axis.text(
+        0.02,
+        0.97,
+        f"EER = {eer_percent}%",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none", "pad": 4},
+    )
     if scale == "log":
-        axes[0].set_ylabel("Pair Count (log scale)")
-        axes[0].set_ylim(bottom=0.8)
+        axis.set_ylabel("Pair Count (log scale)")
+        axis.set_ylim(bottom=0.8)
     else:
-        axes[0].set_ylabel("Density")
+        axis.set_ylabel("Density")
     if x_limit is not None:
-        axes[0].set_xlim(*x_limit)
+        axis.set_xlim(*x_limit)
     if zero_false_accept and zero_false_accept.get("threshold") is not None:
-        axes[0].axvline(
+        axis.axvline(
             zero_false_accept["threshold"],
             color="#111111",
             linestyle="--",
@@ -544,7 +568,7 @@ def plot_results(
             ),
         )
     if zero_false_reject and zero_false_reject.get("threshold") is not None:
-        axes[0].axvline(
+        axis.axvline(
             zero_false_reject["threshold"],
             color="#00897b",
             linestyle=":",
@@ -554,26 +578,7 @@ def plot_results(
                 f"(T={zero_false_reject['threshold']:.4f})"
             ),
         )
-    axes[0].legend(loc="upper right")
-
-    plot_fpr = fpr
-    chance_fpr = np.linspace(0.0, 1.0, 200)
-    x_label_roc = "False Positive Rate"
-
-    axes[1].plot(
-        plot_fpr,
-        evaluation["tpr"],
-        color="#ff8c00",
-        lw=2,
-        label=f"ROC (AUC = {evaluation['roc_auc']:.4f}, EER = {evaluation['eer']:.4f})",
-    )
-    axes[1].plot(chance_fpr, chance_fpr, linestyle="--", color="#6c757d", lw=1)
-    axes[1].set_title("ROC Curve")
-    axes[1].set_xlabel(x_label_roc)
-    axes[1].set_ylabel("True Positive Rate")
-    axes[1].set_xlim(0.0, 1.0)
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].legend(loc="lower right")
+    axis.legend(loc="upper right")
 
     add_figure_metadata(figure, metadata or {})
     figure.tight_layout(rect=(0, 0.04, 1, 1))
@@ -588,7 +593,7 @@ def plot_results(
 
 def main():
     parser = ArgumentParser(
-        description="Compute pairwise iris comparison scores and plot distribution/ROC/EER."
+        description="Compute pairwise iris comparison scores and plot the Hamming-distance distribution."
     )
     parser.add_argument(
         "--dataset-path",
@@ -608,9 +613,19 @@ def main():
         help="Output filename for the figure inside the default output directory. Example: my_run.png",
     )
     parser.add_argument(
+        "--title",
+        default="Hamming Distance Distribution",
+        help="Title shown above the Hamming-distance distribution plot.",
+    )
+    parser.add_argument(
+        "--hide-metadata",
+        action="store_true",
+        help="Hide the run-configuration text at the bottom of the plot.",
+    )
+    parser.add_argument(
         "--rotation",
         type=int,
-        default=21,
+        default=71,
         help="Number of horizontal offsets to evaluate around zero",
     )
     parser.add_argument(
@@ -627,8 +642,8 @@ def main():
     )
     parser.add_argument(
         "--segmenter",
-        choices=["unet", "wahet"],
-        default="unet",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
         help="Segmentation/normalization method to use.",
     )
     parser.add_argument(
@@ -680,6 +695,11 @@ def main():
         type=float,
         default=1e-4,
         help="Target false match rate for printing an operating threshold. Default: 1e-4.",
+    )
+    parser.add_argument(
+        "--show-thresholds",
+        action="store_true",
+        help="Show the zero-false-accept and zero-false-reject threshold lines on the distribution plot.",
     )
     args = parser.parse_args()
 
@@ -741,6 +761,10 @@ def main():
     band_getter = None
     if args.segmenter == "wahet":
         band_getter = build_wahet_band_getter()
+    elif args.segmenter == "myseg":
+        band_getter = build_myseg_band_getter()
+    elif args.segmenter in {"unet", "unet-int8"}:
+        band_getter = build_unet_band_getter(args.segmenter)
     (
         base_codes,
         base_masks,
@@ -887,12 +911,13 @@ def main():
         pairwise["scores"],
         pairwise["same_class"],
         evaluation,
-        zero_false_accept=zero_false_accept,
-        zero_false_reject=zero_false_reject,
+        zero_false_accept=zero_false_accept if args.show_thresholds else None,
+        zero_false_reject=zero_false_reject if args.show_thresholds else None,
         figure_path=figure_output,
         matcher=matcher_name,
-        metadata=plot_metadata,
+        metadata=None if args.hide_metadata else plot_metadata,
         scale=args.scale,
+        title=args.title,
     )
     print(f"Saved analysis figure to {Path(figure_output).expanduser().resolve()}")
 

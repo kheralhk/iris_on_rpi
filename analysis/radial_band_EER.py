@@ -29,7 +29,7 @@ from iris import (
     get_iris_band,
     predict_unet_masks,
 )
-from pairwise_iris_analysis import (
+from hamming_distance_distribution import (
     compute_pairwise_scores_iriscode,
     evaluate_scores,
     summarize_label_pairs,
@@ -161,15 +161,14 @@ def precompute_codes(images, labels, image_names, classifier, rotation):
         kept_labels.append(labels[index - 1])
         kept_image_names.append(image_names[index - 1])
 
-        image_rotated_codes = []
-        image_rotated_masks = []
-        for offset in offsets:
-            code, code_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=int(offset))
-            image_rotated_codes.append(np.asarray(code, dtype=bool))
-            image_rotated_masks.append(np.asarray(code_mask, dtype=bool))
-
-        rotated_codes.append(np.stack(image_rotated_codes, axis=0))
-        rotated_masks.append(np.stack(image_rotated_masks, axis=0))
+        image_rotated_codes, image_rotated_masks = classifier._roll_iris_code_offsets(
+            np.asarray(base_code, dtype=bool),
+            np.asarray(base_mask, dtype=bool),
+            iris_band.shape,
+            offsets,
+        )
+        rotated_codes.append(image_rotated_codes)
+        rotated_masks.append(image_rotated_masks)
 
     if not base_codes:
         raise RuntimeError("Segmentation failed for every sampled image.")
@@ -343,6 +342,38 @@ def plot_rows(rows, figure_path):
     plt.close(figure)
 
 
+def plot_class_scores(rows, figure_path):
+    bands = np.array([row["band"] for row in rows], dtype=np.int32)
+    mean_mated_hd = np.array([row["mean_mated_hd"] for row in rows], dtype=np.float64)
+    mean_non_mated_hd = np.array([row["mean_non_mated_hd"] for row in rows], dtype=np.float64)
+    band_axis = rows[0].get("band_axis", "radial") if rows else "radial"
+    axis_label = "Band (1 = pupil side)" if band_axis == "radial" else "Band (angular sector)"
+    title_suffix = "Radial Band" if band_axis == "radial" else "Horizontal Band"
+
+    figure_width = max(16, min(24, len(bands) * 0.7))
+    figure, axes = plt.subplots(1, 2, figsize=(figure_width, 5.8), sharey=True)
+    series = (
+        (axes[0], mean_mated_hd, "#2b8a3e", f"Mated Comparisons per {title_suffix}"),
+        (axes[1], mean_non_mated_hd, "#c92a2a", f"Non-mated Comparisons per {title_suffix}"),
+    )
+    tick_rotation = 45 if len(bands) > 16 else 0
+    for axis, values, color, title in series:
+        axis.plot(bands, values, color=color, lw=2)
+        axis.scatter(bands, values, color=color, s=28)
+        axis.set_title(title)
+        axis.set_xlabel(axis_label)
+        axis.set_ylabel("Mean Hamming distance")
+        axis.set_ylim(0.0, 1.0)
+        axis.grid(True, alpha=0.3)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=min(12, max(2, len(bands))), integer=True))
+        axis.tick_params(axis="x", labelrotation=tick_rotation, labelsize=8)
+
+    figure.tight_layout()
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(figure_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
 def most_common_offset(offsets):
     offsets = np.asarray(offsets, dtype=np.int16)
     if offsets.size == 0:
@@ -406,8 +437,6 @@ def radial_band_overlay_original(raw_image, classifier, bands, alpha=0.35, disca
         iris_mask,
         pupil_mask,
         eyelash_mask,
-        source_image=gray,
-        oversat_threshold=254,
     )
     pupil_ellipse = fit_boundary_from_mask(pupil_mask, prefer_ellipse=True)
     center = (pupil_ellipse.center_x, pupil_ellipse.center_y)
@@ -709,18 +738,18 @@ def encode_single_image(image, classifier, offsets):
         raise RuntimeError("Segmentation returned None.")
 
     base_code, base_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=0)
-    rotated_codes = []
-    rotated_masks = []
-    for offset in offsets:
-        code, mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=int(offset))
-        rotated_codes.append(np.asarray(code, dtype=bool))
-        rotated_masks.append(np.asarray(mask, dtype=bool))
+    rotated_codes, rotated_masks = classifier._roll_iris_code_offsets(
+        np.asarray(base_code, dtype=bool),
+        np.asarray(base_mask, dtype=bool),
+        iris_band.shape,
+        offsets,
+    )
 
     return (
         np.asarray(base_code, dtype=bool),
         np.asarray(base_mask, dtype=bool),
-        np.stack(rotated_codes, axis=0),
-        np.stack(rotated_masks, axis=0),
+        rotated_codes,
+        rotated_masks,
     )
 
 
@@ -870,6 +899,7 @@ def run_eer(args):
     output_name = args.output_name or f"{dataset_name}_{args.bands}_{args.band_axis}_bands"
     output_dir = Path(args.output_dir).expanduser().resolve()
     figure_path = output_dir / f"{output_name}.png"
+    class_scores_figure_path = output_dir / f"{output_name}_mated_non_mated.png"
 
     print(f"Using dataset format: {dataset_format}")
     print(f"Using dataset path: {dataset_path}")
@@ -1009,6 +1039,7 @@ def run_eer(args):
     overlay_rng = np.random.default_rng(args.seed + 7919)
     overlay_index = int(overlay_rng.integers(0, len(images)))
     plot_rows(rows, figure_path)
+    plot_class_scores(rows, class_scores_figure_path)
     preview_path = save_sample_overlay(
         images[overlay_index],
         output_dir,
@@ -1024,6 +1055,7 @@ def run_eer(args):
     print(f"Best band: {best['band']} {args.band_axis} positions {best['position_start']}:{best['position_end']}")
     print(f"Best EER: {best['eer']:.6f} ({best['eer_percent']:.4f}%)")
     print(f"Saved figure to {figure_path}")
+    print(f"Saved mated/non-mated figure to {class_scores_figure_path}")
     print(f"Saved band preview to {preview_path}")
 
 
@@ -1036,7 +1068,7 @@ def build_parser():
         default=None,
         help="Optional Python filters file containing a 'filters' list.",
     )
-    parser.add_argument("--rotation", type=int, default=21, help="Number of offsets to evaluate around zero.")
+    parser.add_argument("--rotation", type=int, default=71, help="Number of offsets to evaluate around zero (default: 71).")
     parser.add_argument("--bands", type=int, default=16, help="Number of iris bands to evaluate.")
     parser.add_argument(
         "--band-axis",

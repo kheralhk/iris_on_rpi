@@ -3,6 +3,7 @@ h5py
 matplotlib
 numpy
 onnx
+onnxruntime
 opencv-contrib-python
 scikit-learn
 scipy

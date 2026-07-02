@@ -19,7 +19,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
 from dataset_loaders import DATASET_CHOICES, dataset_output_slug, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import IrisClassifier
-from pairwise_iris_analysis import precompute_codes, summarize_label_pairs
+from hamming_distance_distribution import precompute_codes, summarize_label_pairs
 
 
 def parse_int_range(text):
@@ -255,7 +255,7 @@ def main():
         default=None,
         help="Optional Python filters file containing a 'filters' list.",
     )
-    parser.add_argument("--rotation", type=int, default=21)
+    parser.add_argument("--rotation", type=int, default=71)
     parser.add_argument("--parts-range", dest="parts_range", required=True, help="Example: 3-8 or 3,5,7")
     parser.add_argument(
         "--eliminate-range",

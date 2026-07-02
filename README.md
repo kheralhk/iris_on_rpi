@@ -26,7 +26,7 @@ pip install -r requirements.txt
 
 All project and analysis dependencies are kept in the root [`requirements.txt`](requirements.txt).
 
-The active segmentation model is loaded by the pipeline code. If you need to override it for a local experiment, set `SEG_PATH` explicitly when running a command.
+The default segmenter is the quantized U-Net model at `models/upp_scse_mobilenetv2_int8.onnx`. Analysis scripts call it `unet-int8`; use `--segmenter unet` only to compare against the original floating-point model.
 
 ## CLI Usage
 

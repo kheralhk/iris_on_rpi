@@ -3,11 +3,18 @@
 from argparse import ArgumentParser
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
+import tempfile
 
 import cv2 as cv
-import matplotlib.pyplot as plt
+import matplotlib
 import numpy as np
+
+if __name__ == "__main__":
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +30,7 @@ from iris import (
     get_iris_band,
     get_segmentation_backend_name,
     hamming_distances,
+    predict_myseg_masks,
     predict_unet_masks,
 )
 
@@ -31,6 +39,73 @@ filters, _ = load_filter_bank(None)
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "mask_occlusion_tests"
+
+
+def resolve_wahet_executable():
+    local_wahet = Path(__file__).resolve().parent / "wahet"
+    wahet_executable = local_wahet if local_wahet.exists() else shutil.which("wahet")
+    if wahet_executable is None:
+        raise FileNotFoundError(
+            f"--segmenter wahet requested, but WAHET was not found at {local_wahet} or in PATH."
+        )
+    return wahet_executable
+
+
+def get_wahet_source_debug(image):
+    with tempfile.TemporaryDirectory(prefix="wahet_debug_") as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        input_path = tmp_dir / "input.png"
+        band_path = tmp_dir / "band.png"
+        noise_mask_path = tmp_dir / "noise_mask.png"
+        segmentation_path = tmp_dir / "segmentation.png"
+        binary_mask_path = tmp_dir / "binary_mask.png"
+
+        if not cv.imwrite(str(input_path), image):
+            raise RuntimeError(f"Failed to write temporary WAHET input: {input_path}")
+
+        completed = subprocess.run(
+            [
+                str(resolve_wahet_executable()),
+                "-q",
+                "-i",
+                str(input_path),
+                "-o",
+                str(band_path),
+                "-m",
+                str(noise_mask_path),
+                "-sr",
+                str(segmentation_path),
+                "-bm",
+                str(binary_mask_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"WAHET failed with exit code {completed.returncode}: {completed.stderr.strip()}"
+            )
+
+        segmentation = cv.imread(str(segmentation_path), cv.IMREAD_COLOR)
+        binary_mask = cv.imread(str(binary_mask_path), cv.IMREAD_GRAYSCALE)
+        if segmentation is None or binary_mask is None:
+            raise RuntimeError("WAHET did not produce source segmentation diagnostics.")
+
+    valid = binary_mask > 0
+    return {
+        "base_image": image,
+        "gray": image,
+        "overlay": cv.cvtColor(segmentation, cv.COLOR_BGR2RGB),
+        "annulus": valid.astype(np.uint8) * 255,
+        "pupil": np.zeros_like(binary_mask, dtype=np.uint8),
+        "excluded": (~valid).astype(np.uint8) * 255,
+        "valid": valid.astype(np.uint8) * 255,
+        "base_title": "Original Eye Image",
+        "overlay_title": "WAHET Boundaries on Input Image",
+        "valid_title": "WAHET Binary Iris Mask",
+        "excluded_title": "Pixels Outside WAHET Iris Mask",
+        "suptitle": "WAHET source segmentation: red = pupil boundary, green = outer iris boundary",
+    }
 
 
 def add_figure_metadata(figure, metadata):
@@ -49,15 +124,35 @@ def load_image(path):
     return image_path, image
 
 
-def segment_image(image):
-    iris_band, iris_mask = get_iris_band(image)
+def segment_image(image, segmenter="unet-int8"):
+    if segmenter == "wahet":
+        from legacy_iris import get_iris_band as get_wahet_iris_band
+
+        iris_band, iris_mask = get_wahet_iris_band(
+            image,
+            wahet_executable=resolve_wahet_executable(),
+        )
+    else:
+        iris_band, iris_mask = get_iris_band(image, backend=segmenter)
     if iris_band is None or iris_mask is None:
         raise RuntimeError("Iris segmentation failed.")
     return iris_band, iris_mask
 
 
-def get_source_debug(image):
-    gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(image)
+def get_source_debug(image, segmenter="unet-int8"):
+    if segmenter in {"unet", "unet-int8"}:
+        gray, iris_mask, pupil_mask, eyelash_mask = predict_unet_masks(
+            image,
+            backend=segmenter,
+        )
+        overlay_title = f"{segmenter} Segmentation on Input Image"
+    elif segmenter == "myseg":
+        gray, iris_mask, pupil_mask, eyelash_mask = predict_myseg_masks(image)
+        overlay_title = "MySeg Segmentation on Input Image"
+    elif segmenter == "wahet":
+        return get_wahet_source_debug(image)
+    else:
+        raise ValueError(f"Unknown segmenter for mask debug: {segmenter}")
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
     eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
@@ -76,7 +171,7 @@ def get_source_debug(image):
         "excluded": excluded.astype(np.uint8) * 255,
         "valid": valid.astype(np.uint8) * 255,
         "base_title": "Original Eye Image",
-        "overlay_title": "Source Mask Overlay",
+        "overlay_title": overlay_title,
         "valid_title": "Valid Iris Area",
         "excluded_title": "Excluded Iris Area",
     }
@@ -156,6 +251,9 @@ def symmetric_compare_with_details(classifier, iris1, mask1, iris2, mask2, rotat
 
 
 def build_source_mask_overlay(source_debug):
+    if "overlay" in source_debug:
+        return source_debug["overlay"]
+
     gray = source_debug["gray"]
     annulus = source_debug["annulus"] > 0
     excluded = source_debug["excluded"] > 0
@@ -182,7 +280,7 @@ def save_source_overlay_preview(output_path, source_debug, metadata=None):
     figure, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.ravel()
 
-    axes[0].imshow(source_debug["gray"], cmap="gray")
+    axes[0].imshow(source_debug.get("base_image", source_debug["gray"]), cmap="gray")
     axes[0].set_title(source_debug.get("base_title", "Original Eye Image"))
     axes[0].axis("off")
 
@@ -199,7 +297,10 @@ def save_source_overlay_preview(output_path, source_debug, metadata=None):
     axes[3].axis("off")
 
     figure.suptitle(
-        "Overlay colors: green = valid segmentation, purple = excluded area, black = pupil (if available)",
+        source_debug.get(
+            "suptitle",
+            "Overlay colors: green = valid segmentation, purple = excluded area, black = pupil (if available)",
+        ),
         fontsize=12,
     )
     add_figure_metadata(figure, metadata or {})
@@ -209,12 +310,12 @@ def save_source_overlay_preview(output_path, source_debug, metadata=None):
     plt.close(figure)
 
 
-def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations, metadata=None):
-    source_debug = get_source_debug(raw_image)
+def save_overlay_preview(output_path, raw_image, iris_band, iris_mask, kernel_size, iterations, segmenter="unet-int8", metadata=None):
+    source_debug = get_source_debug(raw_image, segmenter=segmenter)
     plot_metadata = {
         "kernel_size": kernel_size,
         "iterations": iterations,
-        "backend": get_segmentation_backend_name(),
+        "backend": get_segmentation_backend_name(segmenter),
         "seg_path": os.environ.get("SEG_PATH"),
     }
     if metadata:
@@ -236,17 +337,19 @@ def run_single(args):
         None,
         args.kernel_size,
         args.iterations,
+        segmenter=args.segmenter,
         metadata={
             "command": "single",
             "image": image_path.name,
             "output_name": args.output_name,
             "rotation": args.rotation,
             "fill_mode": args.fill_mode,
+            "segmenter": args.segmenter,
         },
     )
 
     try:
-        iris_band, iris_mask = segment_image(image)
+        iris_band, iris_mask = segment_image(image, args.segmenter)
     except Exception as exc:
         print(f"Image: {image_path}")
         print(f"Segmentation failed before normalization/matching: {exc}")
@@ -291,7 +394,7 @@ def run_single(args):
     newly_masked_pixels = int(np.sum((iris_mask == 255) & (enlarged_mask != 255)))
 
     print(f"Image: {image_path}")
-    print(f"Backend: {get_segmentation_backend_name()}")
+    print(f"Backend: {get_segmentation_backend_name(args.segmenter)}")
     print(f"Original valid fraction: {original_valid_fraction:.4f}")
     print(f"Enlarged valid fraction: {enlarged_valid_fraction:.4f}")
     print(f"Newly masked pixels: {newly_masked_pixels}")
@@ -337,6 +440,7 @@ def run_multiple(args):
                 None,
                 args.kernel_size,
                 args.iterations,
+                segmenter=args.segmenter,
                 metadata={
                     "command": "multiple",
                     "dataset": dataset_format,
@@ -346,6 +450,7 @@ def run_multiple(args):
                     "max_identities": args.max_identities,
                     "max_images_per_identity": args.max_images_per_identity,
                     "seed": args.seed,
+                    "segmenter": args.segmenter,
                 },
             )
         except Exception:
@@ -379,7 +484,13 @@ def build_parser():
         help="Run test 1 and test 2 on one image.",
     )
     single.add_argument("image", help="Path to the input iris image.")
-    single.add_argument("--rotation", type=int, default=21, help="Number of offsets to evaluate.")
+    single.add_argument("--rotation", type=int, default=71, help="Number of offsets to evaluate (default: 71).")
+    single.add_argument(
+        "--segmenter",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
+        help="Segmentation and normalization method to use.",
+    )
     single.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
     single.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     single.add_argument(
@@ -412,6 +523,12 @@ def build_parser():
         help="Dataset folder layout to load.",
     )
     multiple.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
+    multiple.add_argument(
+        "--segmenter",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
+        help="Segmentation and normalization method to use.",
+    )
     multiple.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     multiple.add_argument("--max-samples", type=int, default=None, help="Optional cap on total sampled images.")
     multiple.add_argument("--max-id", dest="max_identities", type=int, default=10, help="Optional cap on sampled identities.")

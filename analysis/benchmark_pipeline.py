@@ -25,7 +25,9 @@ os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
 from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import (
+    INT8_UNET_ONNX_PATH,
     IrisClassifier as CurrentIrisClassifier,
+    MYSEG_ONNX_PATH,
     UNET_BAND_SHAPE,
     UNET_ONNX_PATH,
     fit_boundary_from_mask,
@@ -34,7 +36,7 @@ from iris import (
     get_segmentation_backend_name,
     normalize_iris_from_boundaries,
 )
-from pairwise_iris_analysis import (
+from hamming_distance_distribution import (
     MATCHER_IRISCODE,
     best_score_against_rotations,
     compute_pairwise_scores_iriscode,
@@ -123,6 +125,30 @@ DEFAULT_PAIRWISE_CONFIGS = {
 }
 
 
+def segmenter_model_path(segmenter, override=None):
+    if override is not None:
+        return Path(override).expanduser().resolve()
+    if segmenter == "myseg":
+        return MYSEG_ONNX_PATH
+    if segmenter == "unet":
+        return UNET_ONNX_PATH
+    if segmenter == "unet-int8":
+        return INT8_UNET_ONNX_PATH
+    return None
+
+
+def segmenter_model_path_str(segmenter, override=None):
+    path = segmenter_model_path(segmenter, override)
+    return None if path is None else str(path)
+
+
+def segmentation_backend_label(segmentation_source):
+    source = str(segmentation_source)
+    if source == "gtmask" or source.startswith("gtmask:"):
+        return "gtmask"
+    return get_segmentation_backend_name(source)
+
+
 def format_result(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -199,6 +225,30 @@ def build_wahet_band_getter():
         return get_wahet_iris_band(image, wahet_executable=wahet_executable)
 
     return get_wahet_band
+
+
+def build_myseg_band_getter():
+    def get_myseg_band(image, _image_name):
+        return get_iris_band(image, backend="myseg")
+
+    return get_myseg_band
+
+
+def build_unet_band_getter(segmenter="unet-int8", model_path=None):
+    resolved_path = segmenter_model_path(segmenter, model_path)
+    if segmenter == "unet-int8":
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "--segmenter unet-int8 requires onnxruntime in the Python environment "
+                "running this benchmark."
+            ) from exc
+
+    def get_unet_band(image, _image_name):
+        return get_iris_band(image, backend=segmenter, model_path=resolved_path)
+
+    return get_unet_band
 
 
 def load_gt_manifest(dataset_format, manifest_root=DEFAULT_GT_MANIFEST_ROOT):
@@ -537,19 +587,28 @@ def run_pairwise_benchmark(
     rotation_consistency_tolerance_offset=None,
     rotation_consistency_score="hd",
     rotation_consistency_match_parts=None,
+    rotation_consistency_aggregation="mean",
+    angular_band_count=None,
+    excluded_angular_bands=None,
+    radial_band_count=None,
+    excluded_radial_bands=None,
     fixed_threshold=None,
     target_fprs=None,
     iris_engine="current",
     test_protocol="pairwise",
-    rotation_method="recompute",
+    rotation_method="roll",
     min_valid_pixels=None,
+    max_samples=None,
     max_identities=None,
     max_images_per_identity=None,
     seed=None,
     band_getter=None,
-    segmentation_source="unet",
+    segmentation_source="unet-int8",
+    segmentation_model_path=None,
     ):
     config = dict(DEFAULT_PAIRWISE_CONFIGS[dataset_format])
+    if max_samples is not None:
+        config["max_samples"] = max_samples
     if max_identities is not None:
         config["max_identities"] = max_identities
     if max_images_per_identity is not None:
@@ -594,6 +653,66 @@ def run_pairwise_benchmark(
         offsets=rotation_offsets,
         rotation_method=rotation_method,
     )
+    angular_band_exclusion = None
+    radial_band_exclusion = None
+    if angular_band_count is not None:
+        from radial_band_EER import band_selector, bit_center_columns
+
+        excluded_angular_bands = sorted(set(excluded_angular_bands or []))
+        center_columns = bit_center_columns(classifier, UNET_BAND_SHAPE)
+        keep_selector = np.ones(center_columns.shape[0], dtype=bool)
+        excluded_bit_count = 0
+        for band_index in excluded_angular_bands:
+            selector, _start, _end, _center = band_selector(
+                center_columns,
+                band_index,
+                angular_band_count,
+                UNET_BAND_SHAPE[1],
+            )
+            keep_selector[selector] = False
+            excluded_bit_count += int(np.sum(selector))
+        if keep_selector.shape[0] != base_masks.shape[1]:
+            raise RuntimeError(
+                f"Angular-band selector length {keep_selector.shape[0]} does not match "
+                f"iriscode length {base_masks.shape[1]}."
+            )
+        base_masks &= keep_selector[None, :]
+        rotated_masks &= keep_selector[None, None, :]
+        angular_band_exclusion = {
+            "band_count": int(angular_band_count),
+            "excluded_bands": [int(value) for value in excluded_angular_bands],
+            "excluded_bits": int(excluded_bit_count),
+            "kept_bits": int(np.sum(keep_selector)),
+        }
+    if radial_band_count is not None:
+        from radial_band_EER import band_selector, bit_center_rows
+
+        excluded_radial_bands = sorted(set(excluded_radial_bands or []))
+        center_rows = bit_center_rows(classifier, UNET_BAND_SHAPE)
+        keep_selector = np.ones(center_rows.shape[0], dtype=bool)
+        excluded_bit_count = 0
+        for band_index in excluded_radial_bands:
+            selector, _start, _end, _center = band_selector(
+                center_rows,
+                band_index,
+                radial_band_count,
+                UNET_BAND_SHAPE[0],
+            )
+            keep_selector[selector] = False
+            excluded_bit_count += int(np.sum(selector))
+        if keep_selector.shape[0] != base_masks.shape[1]:
+            raise RuntimeError(
+                f"Radial-band selector length {keep_selector.shape[0]} does not match "
+                f"iriscode length {base_masks.shape[1]}."
+            )
+        base_masks &= keep_selector[None, :]
+        rotated_masks &= keep_selector[None, None, :]
+        radial_band_exclusion = {
+            "band_count": int(radial_band_count),
+            "excluded_bands": [int(value) for value in excluded_radial_bands],
+            "excluded_bits": int(excluded_bit_count),
+            "kept_bits": int(np.sum(keep_selector)),
+        }
     summary = summarize_label_pairs(kept_labels)
     if test_protocol == "pairwise":
         pairwise = compute_pairwise_scores_iriscode(
@@ -686,6 +805,7 @@ def run_pairwise_benchmark(
             rotation_consistency_tolerance_offset,
             1,
             rotation_consistency_match_parts if rotation_consistency_score == "match-rotation" else None,
+            rotation_consistency_aggregation,
         )
         rotation_summary = summarize_rotation_consistency_predictions(rotation_rows)
         rotation_summary.update(evaluate_rotation_consistency_eer(rotation_rows))
@@ -713,6 +833,7 @@ def run_pairwise_benchmark(
         rotation_consistency_result = {
             "parts": int(rotation_consistency_parts),
             "score": rotation_consistency_score,
+            "part_aggregation": rotation_consistency_aggregation,
             "threshold": float(rotation_consistency_threshold),
             "eliminate": (
                 None
@@ -745,7 +866,7 @@ def run_pairwise_benchmark(
                 "rule": (
                     "rotation_match_count >= threshold"
                     if rotation_consistency_score == "match-rotation"
-                    else "avg_hd <= threshold"
+                    else f"{rotation_consistency_aggregation}_part_hd <= threshold"
                 ),
                 "mated_wrongly_classified_non_mated": rotation_mated_wrong,
                 "non_mated_wrongly_classified_mated": rotation_non_mated_wrong,
@@ -771,12 +892,18 @@ def run_pairwise_benchmark(
         "feature_extractor": feature_extractor,
         "filters_source": filters_source,
         "filters_count": int(len(selected_filters)),
-        "segmentation_backend": get_segmentation_backend_name(),
-        "segmentation_model_path": str(UNET_ONNX_PATH),
+        "segmentation_backend": segmentation_backend_label(segmentation_source),
+        "segmentation_model_path": (
+            segmenter_model_path_str(segmentation_source)
+            if segmentation_model_path is None
+            else str(Path(segmentation_model_path).expanduser().resolve())
+        ),
         "segmentation_source": segmentation_source,
         "iris_engine": iris_engine,
         "test_protocol": test_protocol,
         "rotation_method": rotation_method,
+        "angular_band_exclusion": angular_band_exclusion,
+        "radial_band_exclusion": radial_band_exclusion,
         "min_valid_pixels": (
             None if min_valid_pixels is None else int(min_valid_pixels)
         ),
@@ -810,6 +937,7 @@ def run_pairwise_benchmark(
 
 def main():
     parser = ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Evaluate the U-Net + Gabor iris pipeline for pairwise discrimination."
         )
@@ -838,7 +966,7 @@ def main():
         choices=[dataset for dataset in DATASET_CHOICES if dataset != "auto"],
         help=SUPPRESS,
     )
-    parser.add_argument("--rotation", type=int, default=21, help="Rotation count used for scoring.")
+    parser.add_argument("--rotation", type=int, default=71, help="Rotation count used for scoring (default: 71).")
     parser.add_argument(
         "--test",
         choices=["pairwise", "probe"],
@@ -850,9 +978,18 @@ def main():
     )
     parser.add_argument(
         "--segmenter",
-        choices=["unet", "wahet"],
-        default="unet",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
         help="Segmentation/normalization method to use unless --gt-mask is enabled.",
+    )
+    parser.add_argument(
+        "--segmenter-model",
+        type=Path,
+        default=None,
+        help=(
+            "Override the ONNX model for --segmenter unet or unet-int8. "
+            "The unet-int8 default is models/upp_scse_mobilenetv2_int8.onnx."
+        ),
     )
     parser.add_argument(
         "--rotation-step",
@@ -866,7 +1003,7 @@ def main():
     parser.add_argument(
         "--rotation-method",
         choices=["recompute", "roll"],
-        default="recompute",
+        default="roll",
         help=(
             "How to evaluate rotation offsets. 'recompute' re-encodes each offset before scoring. "
             "'roll' encodes once and circularly rolls iriscode bits/masks per filter grid."
@@ -887,9 +1024,41 @@ def main():
         type=int,
         default=None,
         help=(
-            "Enable part-split average HD with this many iriscode parts. "
+            "Enable part-split HD with this many iriscode parts. "
             "Defaults to --eliminate 0 and --score hd."
         ),
+    )
+    parser.add_argument(
+        "--part-aggregation",
+        choices=["mean", "median"],
+        default="mean",
+        help="Combine selected part HD scores using their mean (default) or median.",
+    )
+    parser.add_argument(
+        "--angular-bands",
+        type=int,
+        default=None,
+        help="Divide iriscode bits into this many angular sectors for --exclude-angular-bands.",
+    )
+    parser.add_argument(
+        "--exclude-angular-bands",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One-based angular sector numbers to exclude from scoring.",
+    )
+    parser.add_argument(
+        "--radial-bands",
+        type=int,
+        default=None,
+        help="Divide iriscode bits into this many radial bands for --exclude-radial-bands.",
+    )
+    parser.add_argument(
+        "--exclude-radial-bands",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One-based radial band numbers to exclude from scoring. Band 1 is closest to the pupil.",
     )
     parser.add_argument(
         "--threshold",
@@ -955,6 +1124,13 @@ def main():
     )
     parser.add_argument("--max-id", dest="max_identities", type=int, default=None)
     parser.add_argument(
+        "--max-img",
+        dest="max_samples",
+        type=int,
+        default=None,
+        help="Maximum total number of images after identity and per-identity sampling.",
+    )
+    parser.add_argument(
         "--max-img-per-id",
         dest="max_images_per_identity",
         type=int,
@@ -992,6 +1168,32 @@ def main():
         raise ValueError("--rotation must be at least 1")
     if args.rotation_step < 1:
         raise ValueError("--rotation-step must be at least 1")
+    if args.exclude_angular_bands is not None and args.angular_bands is None:
+        raise ValueError("--exclude-angular-bands requires --angular-bands")
+    if args.angular_bands is not None:
+        if args.angular_bands < 2:
+            raise ValueError("--angular-bands must be at least 2")
+        excluded_bands = set(args.exclude_angular_bands or [])
+        invalid_bands = sorted(value for value in excluded_bands if value < 1 or value > args.angular_bands)
+        if invalid_bands:
+            raise ValueError(
+                f"Excluded angular bands must be between 1 and {args.angular_bands}: {invalid_bands}"
+            )
+        if len(excluded_bands) >= args.angular_bands:
+            raise ValueError("At least one angular band must remain included")
+    if args.exclude_radial_bands is not None and args.radial_bands is None:
+        raise ValueError("--exclude-radial-bands requires --radial-bands")
+    if args.radial_bands is not None:
+        if args.radial_bands < 2:
+            raise ValueError("--radial-bands must be at least 2")
+        excluded_bands = set(args.exclude_radial_bands or [])
+        invalid_bands = sorted(value for value in excluded_bands if value < 1 or value > args.radial_bands)
+        if invalid_bands:
+            raise ValueError(
+                f"Excluded radial bands must be between 1 and {args.radial_bands}: {invalid_bands}"
+            )
+        if len(excluded_bands) >= args.radial_bands:
+            raise ValueError("At least one radial band must remain included")
     rotation_offsets = build_rotation_offsets(args.rotation, args.rotation_step)
     rotation_consistency_parts = args.rotation_consistency_parts or 5
     if rotation_consistency_parts < 1:
@@ -1019,17 +1221,24 @@ def main():
         raise ValueError("--match-parts cannot be larger than the maximum kept parts after --eliminate")
     if args.max_identities is not None and args.max_identities < 1:
         raise ValueError("--max-id must be at least 1")
+    if args.max_samples is not None and args.max_samples < 1:
+        raise ValueError("--max-img must be at least 1")
     if args.max_images_per_identity is not None and args.max_images_per_identity < 1:
         raise ValueError("--max-img-per-id must be at least 1")
     if args.test == "probe" and args.max_images_per_identity == 1:
         raise ValueError("--test probe needs at least two images per identity; do not use --max-img-per-id 1")
     if args.gtmask and args.segmenter != "unet":
         raise ValueError("--gt-mask cannot be combined with --segmenter; GT masks replace the segmenter.")
+    if args.segmenter_model is not None and args.segmenter not in {"unet", "unet-int8"}:
+        raise ValueError("--segmenter-model is only valid with --segmenter unet or unet-int8")
     for target_fpr in args.target_fpr:
         if target_fpr < 0.0 or target_fpr > 1.0:
             raise ValueError("--target-fpr values must be between 0 and 1")
     if args.min_valid_pixels is not None and args.min_valid_pixels < 0:
         raise ValueError("--min-valid-pixels cannot be negative")
+    selected_model_path = segmenter_model_path(args.segmenter, args.segmenter_model)
+    if not args.gtmask and selected_model_path is not None and not selected_model_path.exists():
+        raise FileNotFoundError(f"Segmentation model not found: {selected_model_path}")
     include_rotation_consistency_classifier = (
         env_flag("ROTATION_CONSISTENCY_CLASSIFIER")
         or args.rotation_consistency_parts is not None
@@ -1081,8 +1290,12 @@ def main():
         "iriscode_bits": iriscode_bits,
         "matcher": MATCHER_IRISCODE,
         "feature_extractor": "gabor",
-        "segmentation_backend": get_segmentation_backend_name(),
-        "segmentation_model_path": str(UNET_ONNX_PATH),
+        "segmentation_backend": segmentation_backend_label("gtmask" if args.gtmask else args.segmenter),
+        "segmentation_model_path": (
+            None
+            if args.gtmask
+            else str(selected_model_path)
+        ),
         "segmentation_source": "gtmask" if args.gtmask else args.segmenter,
         "test_protocol": args.test,
         "rotation_method": args.rotation_method,
@@ -1098,12 +1311,21 @@ def main():
         "rotation": int(args.rotation),
         "rotation_step": int(args.rotation_step),
         "rotation_offsets": [int(offset) for offset in rotation_offsets],
+        "angular_band_exclusion": {
+            "band_count": None if args.angular_bands is None else int(args.angular_bands),
+            "excluded_bands": sorted(set(args.exclude_angular_bands or [])),
+        },
+        "radial_band_exclusion": {
+            "band_count": None if args.radial_bands is None else int(args.radial_bands),
+            "excluded_bands": sorted(set(args.exclude_radial_bands or [])),
+        },
         "pairwise": [],
         "rotation_consistency_classifier": {
             "enabled": bool(include_rotation_consistency_classifier),
             "enabled_by_env": bool(env_flag("ROTATION_CONSISTENCY_CLASSIFIER")),
             "parts": int(rotation_consistency_parts),
             "score": rotation_consistency_score,
+            "part_aggregation": args.part_aggregation,
             "threshold": float(args.rotation_consistency_threshold),
             "eliminate": (
                 None
@@ -1134,6 +1356,10 @@ def main():
         segmentation_source = args.segmenter
         if args.segmenter == "wahet":
             band_getter = build_wahet_band_getter()
+        elif args.segmenter == "myseg":
+            band_getter = build_myseg_band_getter()
+        elif args.segmenter == "unet-int8" or args.segmenter_model is not None:
+            band_getter = build_unet_band_getter(args.segmenter, args.segmenter_model)
         if args.gtmask:
             manifest_path, band_getter = build_gt_band_getter(
                 dataset_format,
@@ -1157,17 +1383,28 @@ def main():
             rotation_consistency_tolerance_offset=args.rotation_consistency_tolerance_offset,
             rotation_consistency_score=rotation_consistency_score,
             rotation_consistency_match_parts=args.rotation_consistency_match_parts,
+            rotation_consistency_aggregation=args.part_aggregation,
+            angular_band_count=args.angular_bands,
+            excluded_angular_bands=args.exclude_angular_bands,
+            radial_band_count=args.radial_bands,
+            excluded_radial_bands=args.exclude_radial_bands,
             fixed_threshold=args.threshold,
             target_fprs=args.target_fpr,
             iris_engine=args.iris_engine,
             test_protocol=args.test,
             rotation_method=args.rotation_method,
             min_valid_pixels=args.min_valid_pixels,
+            max_samples=args.max_samples,
             max_identities=args.max_identities,
             max_images_per_identity=args.max_images_per_identity,
             seed=args.seed,
             band_getter=band_getter,
             segmentation_source=segmentation_source,
+            segmentation_model_path=(
+                None
+                if args.gtmask
+                else selected_model_path
+            ),
         )
         results["pairwise"].append(pairwise_result)
         print(

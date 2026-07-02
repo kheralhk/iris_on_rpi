@@ -24,7 +24,7 @@ if str(ANALYSIS_ROOT) not in sys.path:
 from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import IrisClassifier
-from pairwise_iris_analysis import precompute_codes
+from hamming_distance_distribution import precompute_codes
 DEFAULT_OUTPUT_DIR = ANALYSIS_ROOT / "output" / "score_vs_valid_bits"
 
 
@@ -208,7 +208,7 @@ def parse_args():
     )
     parser.add_argument("--dataset", default="casia-v3-twins", choices=DATASET_CHOICES, help="Dataset format.")
     parser.add_argument("--dataset-path", default=None, help="Override dataset image root.")
-    parser.add_argument("--rotation", type=int, default=21, help="Number of horizontal offsets to evaluate.")
+    parser.add_argument("--rotation", type=int, default=71, help="Number of horizontal offsets to evaluate (default: 71).")
     parser.add_argument("--max-id", dest="max_identities", type=int, default=100)
     parser.add_argument("--max-img-per-id", dest="max_images_per_identity", type=int, default=5)
     parser.add_argument("--max-samples", type=int, default=None)

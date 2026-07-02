@@ -95,7 +95,7 @@ def main():
     parser.add_argument(
         "--rotation",
         type=parse_rotation,
-        default=21,
+        default=71,
         help="Rotation count for iris-vs-code comparisons, or 'none' to disable rotations",
     )
     args = parser.parse_args()

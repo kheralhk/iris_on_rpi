@@ -295,23 +295,39 @@ def _resolve_segmentation_model_path():
             return cwd_candidate
         return (PROJECT_ROOT / path).resolve()
 
-    default_candidates = [
-        PROJECT_ROOT / "models" / "upp_scse_mobilenetv2.onnx",
-        PROJECT_ROOT / "models" / "mysegmenter.onnx",
-    ]
-    for candidate in default_candidates:
-        if candidate.exists():
-            return candidate
-    return default_candidates[0]
+    return PROJECT_ROOT / "models" / "upp_scse_mobilenetv2.onnx"
+
+
+def _resolve_myseg_model_path():
+    configured = os.environ.get("IRIS_MYSEG_ONNX_PATH")
+    if configured is not None:
+        path = Path(configured).expanduser()
+        if path.is_absolute():
+            return path
+        cwd_candidate = path.resolve()
+        if cwd_candidate.exists():
+            return cwd_candidate
+        return (PROJECT_ROOT / path).resolve()
+    return PROJECT_ROOT / "models" / "mysegmenter.onnx"
+
+
+def _resolve_int8_segmentation_model_path():
+    configured = os.environ.get("IRIS_INT8_SEG_PATH")
+    if configured is not None:
+        path = Path(configured).expanduser()
+        return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    return PROJECT_ROOT / "models" / "upp_scse_mobilenetv2_int8.onnx"
 
 
 def get_segmentation_backend_name(backend=None):
     if backend is not None:
         return str(backend)
-    return "unet"
+    return "unet-int8"
 
 
 UNET_ONNX_PATH = _resolve_segmentation_model_path()
+MYSEG_ONNX_PATH = _resolve_myseg_model_path()
+INT8_UNET_ONNX_PATH = _resolve_int8_segmentation_model_path()
 UNET_INPUT_SIZE = (
     int(os.environ.get("IRIS_UNET_INPUT_WIDTH", 480)),
     int(os.environ.get("IRIS_UNET_INPUT_HEIGHT", 640)),
@@ -321,7 +337,8 @@ UNET_BAND_SHAPE = (
     int(os.environ.get("IRIS_UNET_BAND_HEIGHT", DEFAULT_BAND_SHAPE[0])),
     int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
 )
-_UNET_NET = None
+_DNN_NETS = {}
+_ORT_SESSIONS = {}
 
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
@@ -467,20 +484,21 @@ def _resolve_dnn_target(name):
     return mapping.get(name)
 
 
-def _get_unet_net():
-    global _UNET_NET
-    if _UNET_NET is not None:
-        return _UNET_NET
-    if UNET_ONNX_PATH.suffix.lower() != ".onnx":
+def _get_onnx_net(model_path):
+    model_path = Path(model_path).expanduser().resolve()
+    cached = _DNN_NETS.get(model_path)
+    if cached is not None:
+        return cached
+    if model_path.suffix.lower() != ".onnx":
         raise ValueError(
-            f"Segmentation model must be an ONNX file, got: {UNET_ONNX_PATH}"
+            f"Segmentation model must be an ONNX file, got: {model_path}"
         )
-    if not UNET_ONNX_PATH.exists():
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Segmentation ONNX model not found at '{UNET_ONNX_PATH}'. "
+            f"Segmentation ONNX model not found at '{model_path}'. "
             "Set IRIS_SEGMENTATION_ONNX_PATH or place the model there."
         )
-    net = cv.dnn.readNetFromONNX(str(UNET_ONNX_PATH))
+    net = cv.dnn.readNetFromONNX(str(model_path))
     backend_name = os.environ.get("IRIS_UNET_DNN_BACKEND", "opencv").strip().lower()
     target_name = os.environ.get("IRIS_UNET_DNN_TARGET", "cpu").strip().lower()
     backend = _resolve_dnn_backend(backend_name)
@@ -489,8 +507,16 @@ def _get_unet_net():
         net.setPreferableBackend(backend)
     if target is not None:
         net.setPreferableTarget(target)
-    _UNET_NET = net
+    _DNN_NETS[model_path] = net
     return net
+
+
+def _get_unet_net():
+    return _get_onnx_net(UNET_ONNX_PATH)
+
+
+def _get_myseg_net():
+    return _get_onnx_net(MYSEG_ONNX_PATH)
 
 
 def _sigmoid_if_needed(output):
@@ -503,7 +529,7 @@ def _sigmoid_if_needed(output):
 def _prepare_segmentation_gray(img):
     return img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
-def _forward_segmentation_model(img):
+def _forward_segmentation_model(img, model_path=UNET_ONNX_PATH):
     source_gray = _prepare_segmentation_gray(img)
     resized = cv.resize(source_gray, UNET_INPUT_SIZE, interpolation=cv.INTER_LINEAR).astype(np.float32) / 255.0
     rgb = np.repeat(resized[:, :, None], 3, axis=2)
@@ -511,14 +537,73 @@ def _forward_segmentation_model(img):
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     normalized = ((rgb - mean) / std).transpose(2, 0, 1)[None, :, :, :]
 
-    net = _get_unet_net()
+    net = _get_onnx_net(model_path)
     net.setInput(normalized)
     output = net.forward()
     return source_gray, output
 
 
-def predict_unet_masks(img):
-    source_gray, output = _forward_segmentation_model(img)
+def _forward_segmentation_model_ort(img, model_path=INT8_UNET_ONNX_PATH):
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError(
+            "The unet-int8 segmenter requires onnxruntime. Install the analysis requirements."
+        ) from exc
+
+    resolved_path = Path(model_path).expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"INT8 segmentation ONNX model not found: {resolved_path}")
+    session = _ORT_SESSIONS.get(resolved_path)
+    if session is None:
+        session_options = ort.SessionOptions()
+        session_options.log_severity_level = 3
+        session = ort.InferenceSession(
+            str(resolved_path),
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+        _ORT_SESSIONS[resolved_path] = session
+    model_input = session.get_inputs()[0]
+    input_shape = model_input.shape
+    if len(input_shape) != 4 or not all(
+        isinstance(value, int) for value in input_shape[1:]
+    ):
+        raise RuntimeError(f"Expected a fixed NCHW model input, got {input_shape}")
+    _, channels, input_height, input_width = input_shape
+    if channels != 3:
+        raise RuntimeError(f"Expected a three-channel segmenter input, got {channels}")
+
+    source_gray = _prepare_segmentation_gray(img)
+    resized = cv.resize(
+        source_gray,
+        (input_width, input_height),
+        interpolation=cv.INTER_LINEAR,
+    ).astype(np.float32) / 255.0
+    rgb = np.repeat(resized[:, :, None], 3, axis=2)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = ((rgb - mean) / std).transpose(2, 0, 1)[None, :, :, :]
+
+    input_name = model_input.name
+    output = session.run(None, {input_name: normalized})[0]
+    return source_gray, output
+
+
+def predict_unet_masks(img, backend=None, model_path=None):
+    backend_name = get_segmentation_backend_name(backend)
+    if backend_name == "unet-int8":
+        source_gray, output = _forward_segmentation_model_ort(
+            img,
+            model_path=INT8_UNET_ONNX_PATH if model_path is None else model_path,
+        )
+    elif backend_name == "unet":
+        source_gray, output = _forward_segmentation_model(
+            img,
+            model_path=UNET_ONNX_PATH if model_path is None else model_path,
+        )
+    else:
+        raise ValueError(f"Unsupported U-Net backend: {backend_name}")
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
 
@@ -564,8 +649,11 @@ def predict_binary_iris_mask(img):
     return source_gray, iris_mask
 
 
-def _segment_with_unet(img):
-    source_gray, output = _forward_segmentation_model(img)
+def _segment_with_model(img, model_path, runtime="opencv"):
+    if runtime == "onnxruntime":
+        source_gray, output = _forward_segmentation_model_ort(img, model_path=model_path)
+    else:
+        source_gray, output = _forward_segmentation_model(img, model_path=model_path)
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
 
@@ -605,9 +693,44 @@ def _segment_with_unet(img):
     )
 
 
-def get_iris_band(img, backend=None):
-    get_segmentation_backend_name(backend)
-    return _segment_with_unet(img)
+def _segment_with_unet(img):
+    return _segment_with_model(img, UNET_ONNX_PATH)
+
+
+def _segment_with_myseg(img):
+    return _segment_with_model(img, MYSEG_ONNX_PATH)
+
+
+def predict_myseg_masks(img):
+    source_gray, output = _forward_segmentation_model(img, model_path=MYSEG_ONNX_PATH)
+    if output.ndim != 4 or output.shape[1] != 1:
+        raise RuntimeError(f"Unexpected myseg binary segmentation output shape: {output.shape}")
+
+    probability = _sigmoid_if_needed(output[0, 0])
+    image_h, image_w = source_gray.shape
+    resized_probability = cv.resize(probability, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+    annulus_mask = resized_probability >= UNET_THRESHOLD
+    pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
+    iris_mask = clean_component_mask((annulus_mask.astype(bool) | pupil_mask.astype(bool)).astype(np.uint8))
+    eyelash_mask = np.zeros_like(iris_mask, dtype=bool)
+    return source_gray, iris_mask.astype(bool), pupil_mask.astype(bool), eyelash_mask
+
+
+def get_iris_band(img, backend=None, model_path=None):
+    backend_name = get_segmentation_backend_name(backend)
+    if backend_name == "unet":
+        if model_path is not None:
+            return _segment_with_model(img, model_path)
+        return _segment_with_unet(img)
+    if backend_name == "unet-int8":
+        return _segment_with_model(
+            img,
+            INT8_UNET_ONNX_PATH if model_path is None else model_path,
+            runtime="onnxruntime",
+        )
+    if backend_name == "myseg":
+        return _segment_with_myseg(img)
+    raise ValueError(f"Unknown segmentation backend: {backend_name}")
 
 class IrisClassifier():
     def __init__(self, filters) -> None:
@@ -624,7 +747,7 @@ class IrisClassifier():
             self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
 
-    def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0, rotation_method="recompute"):
+    def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0, rotation_method="roll"):
         bits_1, mask_1, _ = self.get_iris_code(iris1, mask1)
         return self.compare_iris_code_and_iris(
             iris2,
@@ -680,8 +803,16 @@ class IrisClassifier():
         bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=(offset,))
         return bits[0], mask_bits[0], filters[0]
 
-    def get_iris_codes(self, iris, mask=None, offsets=(0,)):
-        bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=offsets)
+    def get_iris_codes(self, iris, mask=None, offsets=(0,), rotation_method="roll"):
+        offsets = np.asarray(offsets, dtype=np.int64)
+        if rotation_method == "recompute":
+            return self._encode_iris_offsets(iris, mask, offsets=offsets)
+        if rotation_method != "roll":
+            raise ValueError(f"Unknown rotation method: {rotation_method}")
+
+        base_bits, base_mask, base_filters = self.get_iris_code(iris, mask, offset=0)
+        bits, mask_bits = self._roll_iris_code_offsets(base_bits, base_mask, iris.shape, offsets)
+        filters = np.broadcast_to(base_filters, bits.shape).copy()
         return bits, mask_bits, filters
 
     @staticmethod
@@ -728,14 +859,19 @@ class IrisClassifier():
         iris_code_mask,
         rotation=None,
         offset=0,
-        rotation_method="recompute",
+        rotation_method="roll",
     ):
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
             return (hamming_distance(bits, iris_code, mask, iris_code_mask), 0)
         offsets = np.arange(rotation) - rotation // 2
         if rotation_method == "recompute":
-            bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
+            bits, masks, _ = self.get_iris_codes(
+                iris,
+                iris_mask,
+                offsets=offsets,
+                rotation_method="recompute",
+            )
         elif rotation_method == "roll":
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=0)
             bits, masks = self._roll_iris_code_offsets(bits, mask, iris.shape, offsets)

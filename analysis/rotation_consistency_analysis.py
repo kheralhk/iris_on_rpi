@@ -250,7 +250,7 @@ def main():
         default=None,
         help="Optional Python filters file containing a 'filters' list.",
     )
-    parser.add_argument("--rotation", type=int, default=21, help="Number of offsets to evaluate around zero.")
+    parser.add_argument("--rotation", type=int, default=71, help="Number of offsets to evaluate around zero (default: 71).")
     parser.add_argument("--min-valid-bits", type=int, default=1, help="Minimum valid bits required in a subpart/offset.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-name", default=None)

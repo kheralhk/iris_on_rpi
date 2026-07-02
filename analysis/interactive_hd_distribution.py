@@ -64,11 +64,15 @@ if str(ANALYSIS_ROOT) not in sys.path:
 
 from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
-from iris import IrisClassifier, get_segmentation_backend_name
+from iris import get_segmentation_backend_name
 from mask_occlusion_tests import build_source_mask_overlay, get_source_debug
-from pairwise_iris_analysis import (
+from hamming_distance_distribution import (
     MATCHER_IRISCODE,
+    build_myseg_band_getter,
+    build_unet_band_getter,
+    build_wahet_band_getter,
     compute_pairwise_scores_iriscode,
+    load_iris_classifier_class,
     precompute_codes,
     summarize_label_pairs,
 )
@@ -136,11 +140,13 @@ def load_pairwise_npz(path):
     rotation = scalar_from_npz(data["rotation"], None) if "rotation" in data.files else None
     matcher = scalar_from_npz(data["matcher"], MATCHER_IRISCODE) if "matcher" in data.files else MATCHER_IRISCODE
     parts = scalar_from_npz(data["parts"], None) if "parts" in data.files else None
+    iris_engine = scalar_from_npz(data["iris_engine"], None) if "iris_engine" in data.files else None
+    segmenter = scalar_from_npz(data["segmenter"], None) if "segmenter" in data.files else None
     if parts is not None:
         parts = int(parts)
         if parts < 1:
             parts = None
-    return pairwise, labels, image_names, dataset_path, rotation, matcher, parts
+    return pairwise, labels, image_names, dataset_path, rotation, matcher, parts, iris_engine, segmenter
 
 
 def compute_pairwise_scores_parts(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets, parts):
@@ -228,8 +234,18 @@ def compute_pairwise(args):
     print(f"Using dataset path: {dataset_path}")
     print(f"Filters in use: {len(selected_filters)}")
     print(f"Filters source: {filters_source}")
+    print(f"Iris engine: {args.iris_engine}")
+    print(f"Segmenter: {args.segmenter}")
 
-    classifier = IrisClassifier(selected_filters)
+    classifier_class = load_iris_classifier_class(args.iris_engine)
+    classifier = classifier_class(selected_filters)
+    band_getter = None
+    if args.segmenter == "wahet":
+        band_getter = build_wahet_band_getter()
+    elif args.segmenter == "myseg":
+        band_getter = build_myseg_band_getter()
+    elif args.segmenter in {"unet", "unet-int8"}:
+        band_getter = build_unet_band_getter(args.segmenter)
     (
         base_codes,
         base_masks,
@@ -239,7 +255,14 @@ def compute_pairwise(args):
         labels,
         image_names,
         skipped,
-    ) = precompute_codes(images, labels, image_names, classifier, args.rotation)
+    ) = precompute_codes(
+        images,
+        labels,
+        image_names,
+        classifier,
+        args.rotation,
+        band_getter=band_getter,
+    )
     if skipped:
         print(f"Skipped {len(skipped)} images due to segmentation failure.")
 
@@ -275,7 +298,18 @@ def output_paths(output_dir, dataset_format, output_name):
     return base_dir / f"{clean_name}.png", base_dir / f"{clean_name}_scores.npz"
 
 
-def save_pairwise_cache(output_path, pairwise, labels, image_names, dataset_path, rotation, matcher, parts=None):
+def save_pairwise_cache(
+    output_path,
+    pairwise,
+    labels,
+    image_names,
+    dataset_path,
+    rotation,
+    matcher,
+    parts=None,
+    iris_engine="current",
+    segmenter="unet-int8",
+):
     idx1 = pairwise["idx1"]
     idx2 = pairwise["idx2"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +329,8 @@ def save_pairwise_cache(output_path, pairwise, labels, image_names, dataset_path
         rotation=np.array(rotation),
         matcher=np.array(matcher),
         parts=np.array(-1 if parts is None else int(parts)),
+        iris_engine=np.array(iris_engine),
+        segmenter=np.array(segmenter),
     )
     return output_path
 
@@ -308,8 +344,9 @@ def load_grayscale(dataset_path, image_name):
 
 
 class MaskOverlayCache:
-    def __init__(self, dataset_path):
+    def __init__(self, dataset_path, segmenter):
         self.dataset_path = Path(dataset_path)
+        self.segmenter = segmenter
         self._cache = {}
 
     def get(self, image_name):
@@ -319,10 +356,10 @@ class MaskOverlayCache:
             return cached
 
         image = load_grayscale(self.dataset_path, key)
-        source_debug = get_source_debug(image)
+        source_debug = get_source_debug(image, segmenter=self.segmenter)
         overlay = build_source_mask_overlay(source_debug)
         result = {
-            "gray": source_debug["gray"],
+            "gray": source_debug.get("base_image", source_debug["gray"]),
             "overlay": overlay,
             "valid": source_debug["valid"],
             "excluded": source_debug["excluded"],
@@ -342,6 +379,7 @@ class InteractiveDistribution:
         selection_width,
         show_pairs,
         figure_output_path,
+        segmenter,
         scale="linear",
         click_output_dir=None,
     ):
@@ -355,7 +393,7 @@ class InteractiveDistribution:
         self.figure_output_path = Path(figure_output_path).expanduser().resolve()
         self.scale = str(scale)
         self.mode = "all"
-        self.overlay_cache = MaskOverlayCache(self.dataset_path)
+        self.overlay_cache = MaskOverlayCache(self.dataset_path, segmenter)
         self.click_output_dir = Path(click_output_dir).expanduser().resolve() if click_output_dir else None
         self.click_count = 0
         self.figure = None
@@ -565,15 +603,27 @@ def parse_args():
             "Click the distribution to see the image pairs and source mask overlays near that HD."
         )
     )
-    parser.add_argument("--scores", default=None, help="Optional .npz from pairwise_iris_analysis.py --output.")
+    parser.add_argument("--scores", default=None, help="Optional .npz score cache.")
     parser.add_argument("--dataset", default="auto", choices=DATASET_CHOICES, help="Dataset format to compute.")
     parser.add_argument("--dataset-path", default=None, help="Dataset root. Required when --scores lacks dataset_path.")
-    parser.add_argument("--rotation", type=int, default=21, help="Rotation count used when computing scores.")
+    parser.add_argument("--rotation", type=int, default=71, help="Rotation count used when computing scores (default: 71).")
     parser.add_argument(
         "--filters",
         dest="filters",
         default=None,
         help="Optional Python filters file containing a 'filters' list.",
+    )
+    parser.add_argument(
+        "--iris-engine",
+        choices=["current", "legacy"],
+        default="current",
+        help="Recognition engine to use for iriscode generation and comparison.",
+    )
+    parser.add_argument(
+        "--segmenter",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
+        help="Segmentation and normalization method to use.",
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-id", dest="max_identities", type=int, default=None)
@@ -617,7 +667,17 @@ def main():
         raise ValueError("--parts must be at least 1")
 
     if args.scores:
-        pairwise, labels, image_names, saved_dataset_path, rotation, matcher, cached_parts = load_pairwise_npz(args.scores)
+        (
+            pairwise,
+            labels,
+            image_names,
+            saved_dataset_path,
+            rotation,
+            matcher,
+            cached_parts,
+            cached_iris_engine,
+            cached_segmenter,
+        ) = load_pairwise_npz(args.scores)
         if args.parts is not None and cached_parts != args.parts:
             raise ValueError(
                 "--parts cannot change an existing score cache. "
@@ -629,10 +689,14 @@ def main():
         dataset_format = args.dataset
         rotation = args.rotation if rotation is None else rotation
         parts = cached_parts
+        iris_engine = cached_iris_engine or args.iris_engine
+        segmenter = cached_segmenter or args.segmenter
         save_cache = False
     else:
         pairwise, labels, image_names, dataset_path, rotation, matcher, dataset_format = compute_pairwise(args)
         parts = args.parts
+        iris_engine = args.iris_engine
+        segmenter = args.segmenter
         save_cache = True
 
     figure_output_path, score_cache_path = output_paths(args.output_dir, dataset_format, args.output_name)
@@ -646,6 +710,8 @@ def main():
             rotation,
             matcher,
             parts,
+            iris_engine,
+            segmenter,
         )
         print(f"Saved interactive score cache to {saved_cache}")
 
@@ -653,7 +719,8 @@ def main():
         "dataset": dataset_format,
         "dataset_path": str(Path(dataset_path).expanduser().resolve()),
         "seg_path": os.environ.get("SEG_PATH"),
-        "segmentation_backend": get_segmentation_backend_name(),
+        "segmentation_backend": get_segmentation_backend_name(segmenter),
+        "iris_engine": iris_engine,
         "matcher": matcher,
         "rotation": rotation,
         "parts": parts,
@@ -672,6 +739,7 @@ def main():
         selection_width=args.selection_width,
         show_pairs=args.show_pairs,
         figure_output_path=figure_output_path,
+        segmenter=segmenter,
         scale=args.scale,
         click_output_dir=args.click_output_dir,
     )

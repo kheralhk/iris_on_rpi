@@ -29,8 +29,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from filter_loader import load_filter_bank
-from iris import IrisClassifier as CurrentIrisClassifier, get_iris_band, hamming_distance, hamming_distances
-from pairwise_iris_analysis import (
+from iris import (
+    INT8_UNET_ONNX_PATH,
+    IrisClassifier as CurrentIrisClassifier,
+    get_iris_band,
+    hamming_distance,
+    hamming_distances,
+)
+from hamming_distance_distribution import (
     MATCHER_IRISCODE,
 )
 from rotation_part_scoring import part_scores_for_offsets, select_parts, split_code_slices
@@ -65,6 +71,13 @@ def file_sha256(path):
 
 def segment_image(image):
     iris_band, iris_mask = get_iris_band(image)
+    if iris_band is None or iris_mask is None:
+        raise RuntimeError("Iris segmentation failed.")
+    return iris_band, iris_mask
+
+
+def segment_image_myseg(image):
+    iris_band, iris_mask = get_iris_band(image, backend="myseg")
     if iris_band is None or iris_mask is None:
         raise RuntimeError("Iris segmentation failed.")
     return iris_band, iris_mask
@@ -119,7 +132,15 @@ def timed_encode(classifier, iris_band, iris_mask, profile=None, step_name="enco
 
 def timed_encode_offsets(classifier, iris_band, iris_mask, offsets, profile=None, step_name="encoding_offsets"):
     start = time.perf_counter()
-    result = classifier.get_iris_codes(iris_band, iris_mask, offsets=offsets)
+    if hasattr(classifier, "_roll_iris_code_offsets"):
+        result = classifier.get_iris_codes(
+            iris_band,
+            iris_mask,
+            offsets=offsets,
+            rotation_method="recompute",
+        )
+    else:
+        result = classifier.get_iris_codes(iris_band, iris_mask, offsets=offsets)
     record_step(profile, step_name, start)
     return result
 
@@ -156,9 +177,33 @@ def timed_rotation_codes(classifier, iris_band, iris_mask, offsets, rotation_met
     raise ValueError(f"Unknown rotation method: {rotation_method}")
 
 
-def build_segmenter(segmenter):
+def build_segmenter(segmenter, model_path=None):
     if segmenter == "unet":
+        if model_path is not None:
+            def segment_with_model(image):
+                return get_iris_band(image, backend="unet", model_path=model_path)
+
+            return segment_with_model
         return segment_image
+    if segmenter == "unet-int8":
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "--segmenter unet-int8 requires onnxruntime in the Python environment "
+                "running this benchmark."
+            ) from exc
+
+        def segment_with_int8(image):
+            return get_iris_band(
+                image,
+                backend="unet-int8",
+                model_path=INT8_UNET_ONNX_PATH if model_path is None else model_path,
+            )
+
+        return segment_with_int8
+    if segmenter == "myseg":
+        return segment_image_myseg
     if segmenter == "wahet":
         local_wahet = Path(__file__).resolve().parent / "wahet"
         wahet_executable = local_wahet if local_wahet.exists() else shutil.which("wahet")
@@ -272,13 +317,24 @@ def database_cache_path(path):
     return cache_path.resolve()
 
 
-def database_cache_metadata(database_images, database_size, iris_engine, segmenter, filters_source):
+def database_cache_metadata(
+    database_images,
+    database_size,
+    iris_engine,
+    segmenter,
+    filters_source,
+    segmenter_model=None,
+):
     return {
         "version": 1,
         "database_size": int(database_size),
         "database_images": [str(path) for path in database_images],
         "iris_engine": iris_engine,
         "segmenter": segmenter,
+        "segmenter_model": None if segmenter_model is None else str(segmenter_model),
+        "segmenter_model_sha256": (
+            None if segmenter_model is None else file_sha256(segmenter_model)
+        ),
         "filters_source": str(Path(filters_source).expanduser().resolve()),
         "filters_sha256": file_sha256(filters_source),
     }
@@ -385,7 +441,7 @@ def compare_iris_code_parts(
     return selected["avg_hd"], selected["anchor_offset"]
 
 
-def compare_iris_code_operation(classifier, image, stored_code, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+def compare_iris_code_operation(classifier, image, stored_code, offsets, segmenter, parts=None, rotation_method="roll", profile=None):
     iris_band, iris_mask = timed_segment(image, segmenter, profile, "compare_template.segmentation")
     if parts is not None:
         start = time.perf_counter()
@@ -419,7 +475,7 @@ def compare_iris_code_operation(classifier, image, stored_code, offsets, segment
     return float(scores[best_index]), int(offsets[best_index])
 
 
-def compare_image_operation(classifier, image1, image2, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+def compare_image_operation(classifier, image1, image2, offsets, segmenter, parts=None, rotation_method="roll", profile=None):
     iris1, mask1 = timed_segment(image1, segmenter, profile, "compare_image.segmentation")
     iris2, mask2 = timed_segment(image2, segmenter, profile, "compare_image.segmentation")
     code1, code_mask1, _ = timed_encode(classifier, iris1, mask1, profile, "compare_image.template_encoding")
@@ -452,7 +508,7 @@ def compare_image_operation(classifier, image1, image2, offsets, segmenter, part
     return float(scores[best_index]), int(offsets[best_index])
 
 
-def find_operation(classifier, query_image, codes, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+def find_operation(classifier, query_image, codes, offsets, segmenter, parts=None, rotation_method="roll", profile=None):
     iris_band, iris_mask = timed_segment(query_image, segmenter, profile, "find.segmentation")
     iris_codes, mask_codes, _ = timed_rotation_codes(
         classifier,
@@ -498,12 +554,12 @@ def find_operation(classifier, query_image, codes, offsets, segmenter, parts=Non
     return best_match, best_score
 
 
-def plot_benchmark_results(results, output_name, title, metadata=None):
+def plot_benchmark_results(results, output_name, title, database_size, metadata=None):
     labels = [
         "Enroll",
-        "Compare Iris Code",
-        "Compare Image",
-        "Find",
+        "Match image to\nstored iriscode (1:1)",
+        "Match two images\n(image-to-image)",
+        f"Search database\n(1:{database_size})",
     ]
     means = [result["mean"] for result in results]
     stds = [result["std"] for result in results]
@@ -580,8 +636,8 @@ def main():
     parser.add_argument(
         "--rotation",
         type=int,
-        default=1,
-        help="Rotation count used for comparison and find operations. The default 1 keeps the no-rotation behavior.",
+        default=71,
+        help="Rotation count used for comparison and find operations (default: 71).",
     )
     parser.add_argument(
         "--rotation-step",
@@ -592,7 +648,7 @@ def main():
     parser.add_argument(
         "--rotation-method",
         choices=["recompute", "roll"],
-        default="recompute",
+        default="roll",
         help=(
             "How to evaluate rotation offsets. 'recompute' re-encodes each offset before scoring. "
             "'roll' encodes once and circularly rolls iriscode bits/masks per filter grid."
@@ -630,9 +686,18 @@ def main():
     )
     parser.add_argument(
         "--segmenter",
-        choices=["unet", "wahet"],
-        default="unet",
+        choices=["unet", "unet-int8", "myseg", "wahet"],
+        default="unet-int8",
         help="Segmentation/normalization method to use.",
+    )
+    parser.add_argument(
+        "--segmenter-model",
+        type=Path,
+        default=None,
+        help=(
+            "Override the ONNX model for --segmenter unet or unet-int8. "
+            "The unet-int8 default is models/upp_scse_mobilenetv2_int8.onnx."
+        ),
     )
     args = parser.parse_args()
 
@@ -646,6 +711,16 @@ def main():
         raise ValueError("--database-size must be at least 1")
     if args.parts is not None and args.parts < 1:
         raise ValueError("--parts must be at least 1")
+    if args.segmenter_model is not None and args.segmenter not in {"unet", "unet-int8"}:
+        raise ValueError("--segmenter-model is only valid with --segmenter unet or unet-int8")
+
+    segmenter_model = args.segmenter_model
+    if args.segmenter == "unet-int8" and segmenter_model is None:
+        segmenter_model = INT8_UNET_ONNX_PATH
+    if segmenter_model is not None:
+        segmenter_model = Path(segmenter_model).expanduser().resolve()
+        if not segmenter_model.exists():
+            raise FileNotFoundError(f"Segmentation model not found: {segmenter_model}")
 
     query_image = load_image(args.query_image)
     compare_image = load_image(args.compare_image)
@@ -654,13 +729,15 @@ def main():
     classifier_class = load_iris_classifier_class(args.iris_engine)
     if args.rotation_method == "roll" and args.iris_engine != "current":
         raise ValueError("--rotation-method roll is only available with --iris-engine current.")
-    segmenter = build_segmenter(args.segmenter)
+    segmenter = build_segmenter(args.segmenter, segmenter_model)
     offsets = rotation_offsets(args.rotation, args.rotation_step)
 
     print(f"Filters in use: {len(selected_filters)}")
     print(f"Filters source: {filters_source}")
     print(f"Iris engine: {args.iris_engine}")
     print(f"Segmenter: {args.segmenter}")
+    if segmenter_model is not None:
+        print(f"Segmenter model: {segmenter_model}")
     print(f"Rotation method: {args.rotation_method}")
     print(f"Rotation offsets: {','.join(str(int(offset)) for offset in offsets)}")
     classifier = classifier_class(selected_filters)
@@ -670,6 +747,7 @@ def main():
         args.iris_engine,
         args.segmenter,
         filters_source,
+        segmenter_model,
     )
     stored_database = load_or_build_database(
         classifier,
@@ -738,11 +816,12 @@ def main():
     if args.rotation_step > 1:
         rotation_label = f"{rotation_label}, step {args.rotation_step}"
     parts_label = "whole iriscode" if args.parts is None else f"{args.parts} parts"
-    title = f"CLI Benchmark ({MATCHER_IRISCODE}, {rotation_label}, {parts_label})"
+    title = f"Iris Recognition Operation Speed ({rotation_label}, {parts_label})"
     plot_benchmark_results(
         results,
         args.output_name,
         title,
+        stored_database.shape[1],
         metadata={
             "query_image": Path(args.query_image).name,
             "compare_image": Path(args.compare_image).name,
@@ -758,6 +837,7 @@ def main():
             "matcher": MATCHER_IRISCODE,
             "iris_engine": args.iris_engine,
             "segmenter": args.segmenter,
+            "segmenter_model": segmenter_model,
             "filter_count": len(selected_filters),
             "filters_source": filters_source,
             "output_name": args.output_name,

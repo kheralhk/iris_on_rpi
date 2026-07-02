@@ -57,7 +57,7 @@ def part_scores_for_offsets(base_code, base_mask, candidate_codes, candidate_mas
     return part_scores, part_offsets
 
 
-def select_parts(part_scores, part_offsets, eliminate=0, tolerance_offset=None):
+def select_parts(part_scores, part_offsets, eliminate=0, tolerance_offset=None, aggregation="mean"):
     part_scores = np.asarray(part_scores, dtype=np.float64)
     part_offsets = np.asarray(part_offsets, dtype=np.int16)
     if part_scores.size == 0:
@@ -65,10 +65,14 @@ def select_parts(part_scores, part_offsets, eliminate=0, tolerance_offset=None):
     if part_scores.shape != part_offsets.shape:
         raise ValueError("part_scores and part_offsets must have the same shape")
 
+    if aggregation not in {"mean", "median"}:
+        raise ValueError("aggregation must be 'mean' or 'median'")
+
     finite = np.isfinite(part_scores)
     if not np.any(finite):
         return {
             "avg_hd": float("inf"),
+            "aggregation": aggregation,
             "anchor_offset": 0,
             "selected_indices": [],
             "selected_offsets": [],
@@ -97,9 +101,16 @@ def select_parts(part_scores, part_offsets, eliminate=0, tolerance_offset=None):
                 keep_count = 1
             else:
                 keep_count = selected_indices.size - eliminate
-            distance = np.abs(part_offsets[selected_indices] - anchor_offset)
-            order = np.lexsort((part_scores[selected_indices], distance))
-            selected_indices = selected_indices[order[:keep_count]]
+            scores = part_scores[selected_indices]
+            anchor_tie_break = selected_indices == anchor_index
+            elimination_order = np.lexsort(
+                (selected_indices, anchor_tie_break, -scores)
+            )
+            eliminate_count = selected_indices.size - keep_count
+            eliminated_indices = selected_indices[elimination_order[:eliminate_count]]
+            selected_indices = selected_indices[
+                ~np.isin(selected_indices, eliminated_indices)
+            ]
 
     if selected_indices.size == 0:
         selected_indices = np.array([anchor_index], dtype=np.int64)
@@ -112,8 +123,12 @@ def select_parts(part_scores, part_offsets, eliminate=0, tolerance_offset=None):
         tolerance = int(tolerance_offset)
         rotation_match_count = int(np.sum(np.abs(selected_offsets - anchor_offset) <= tolerance))
 
+    aggregate_hd = np.mean(selected_scores) if aggregation == "mean" else np.median(selected_scores)
     return {
-        "avg_hd": float(np.mean(selected_scores)),
+        # Keep avg_hd for compatibility with existing result readers. With median
+        # aggregation it contains the median selected-part HD.
+        "avg_hd": float(aggregate_hd),
+        "aggregation": aggregation,
         "anchor_offset": anchor_offset,
         "selected_indices": [int(index) for index in selected_indices],
         "selected_offsets": [int(offset) for offset in selected_offsets],
@@ -136,6 +151,7 @@ def compute_pairwise_rotation_classifier(
     tolerance_offset=None,
     min_valid_bits=1,
     match_parts=None,
+    aggregation="mean",
 ):
     slices = split_code_slices(base_codes.shape[1], parts)
     rows = []
@@ -161,8 +177,8 @@ def compute_pairwise_rotation_classifier(
             slices,
             min_valid_bits=min_valid_bits,
         )
-        result_12 = select_parts(scores_12, offsets_12, eliminate, tolerance_offset)
-        result_21 = select_parts(scores_21, offsets_21, eliminate, tolerance_offset)
+        result_12 = select_parts(scores_12, offsets_12, eliminate, tolerance_offset, aggregation)
+        result_21 = select_parts(scores_21, offsets_21, eliminate, tolerance_offset, aggregation)
 
         if result_12["avg_hd"] <= result_21["avg_hd"]:
             chosen = result_12
@@ -191,6 +207,7 @@ def compute_pairwise_rotation_classifier(
                 "prediction_mode": prediction_mode,
                 "prediction_score": prediction_score,
                 "avg_hd": float(chosen["avg_hd"]),
+                "aggregation": aggregation,
                 "anchor_offset": int(chosen["anchor_offset"]),
                 "rotation_match_count": int(chosen["rotation_match_count"]),
                 "kept_parts": int(chosen["kept_parts"]),

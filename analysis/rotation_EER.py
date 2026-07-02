@@ -26,7 +26,7 @@ from matplotlib.ticker import MaxNLocator
 from dataset_loaders import DATASET_CHOICES, dataset_output_slug, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import IrisClassifier, get_iris_band, hamming_distances
-from pairwise_iris_analysis import evaluate_scores, summarize_label_pairs
+from hamming_distance_distribution import evaluate_scores, summarize_label_pairs
 
 def add_figure_metadata(fig, metadata):
     if not metadata:
@@ -468,7 +468,7 @@ def plot_curve(curve_specs, axis_name, dataset_format, figure_path, metadata=Non
 
 def main():
     parser = ArgumentParser(
-        description="Sweep rotation-consistency EER across horizontal offset ranges.",
+        description="Sweep EER across horizontal offset ranges.",
         allow_abbrev=False,
     )
     parser.add_argument(
@@ -525,17 +525,25 @@ def main():
         "--score",
         choices=["hd", "match-rotation"],
         default="hd",
-        help="Rotation-consistency EER score to sweep: selected-part HD or matching rotation count.",
+        help=(
+            "Score to sweep. 'hd' uses normal whole-iriscode Hamming distance unless --parts is set; "
+            "'match-rotation' uses part-based rotation consistency."
+        ),
     )
     parser.add_argument(
         "--compare-methods",
         action="store_true",
         help=(
             "Plot normal whole-iriscode HD against the rotation-consistency parts average-HD method. "
-            "Use with --score hd."
+            "Use with --score hd. If --parts is omitted, the comparison uses 4 parts."
         ),
     )
-    parser.add_argument("--parts", type=int, default=4, help="Parts for rotation-consistency EER.")
+    parser.add_argument(
+        "--parts",
+        type=int,
+        default=None,
+        help="Opt in to part-based scoring with this many iriscode parts.",
+    )
     parser.add_argument("--eliminate", type=int, default=0, help="Outlier parts to eliminate for rotation-consistency EER.")
     parser.add_argument(
         "--tolerance-offset",
@@ -575,17 +583,19 @@ def main():
         raise ValueError("rotation_EER.py with --score currently requires --axis horizontal")
     if args.compare_methods and args.score != "hd":
         raise ValueError("--compare-methods compares baseline HD against parts average-HD, so use --score hd")
-    if args.parts < 1:
+    parts_requested = args.parts is not None or args.compare_methods or args.score == "match-rotation"
+    part_count = args.parts if args.parts is not None else 4
+    if args.parts is not None and args.parts < 1:
         raise ValueError("--parts must be at least 1")
     if args.eliminate < 0:
         raise ValueError("--eliminate cannot be negative")
-    if args.eliminate >= args.parts:
+    if parts_requested and args.eliminate >= part_count:
         raise ValueError("--eliminate must be smaller than --parts")
     if args.match_parts < 1:
         raise ValueError("--match-parts must be at least 1")
-    if args.tolerance_offset is None and args.match_parts > max(1, args.parts - args.eliminate):
+    if args.tolerance_offset is None and args.match_parts > max(1, part_count - args.eliminate):
         raise ValueError("--match-parts cannot be larger than the maximum kept parts after --eliminate")
-    if args.match_parts > args.parts:
+    if parts_requested and args.match_parts > part_count:
         raise ValueError("--match-parts cannot be larger than --parts")
     if args.tolerance_offset is not None and args.tolerance_offset < 0:
         raise ValueError("--tolerance-offset cannot be negative")
@@ -622,36 +632,36 @@ def main():
             args.max_offset_range,
         )
 
-    baseline_curve = None
     curve_specs = []
-    if args.compare_methods:
+    if not parts_requested or args.compare_methods:
         baseline_curve = sweep_eer(labels, precomputed)
         curve_specs.append({"label": "Baseline whole iriscode HD", "curve": baseline_curve})
 
-    score = args.score
-    curve = sweep_rotation_consistency_eer(
-        labels,
-        precomputed,
-        args.parts,
-        args.threshold,
-        args.eliminate,
-        args.tolerance_offset,
-        min_valid_bits,
-        score,
-        args.match_parts,
-    )
-    part_selection = (
-        f"tolerance={args.tolerance_offset}"
-        if args.tolerance_offset is not None
-        else f"eliminate={args.eliminate}"
-    )
-    label = f"Parts average HD, parts={args.parts}, {part_selection}"
-    if score == "match-rotation":
-        label = (
-            f"Rotation consistency match-parts={args.match_parts}, "
-            f"parts={args.parts}, {part_selection}"
+    if parts_requested:
+        score = args.score
+        curve = sweep_rotation_consistency_eer(
+            labels,
+            precomputed,
+            part_count,
+            args.threshold,
+            args.eliminate,
+            args.tolerance_offset,
+            min_valid_bits,
+            score,
+            args.match_parts,
         )
-    curve_specs.append({"label": label, "curve": curve})
+        part_selection = (
+            f"tolerance={args.tolerance_offset}"
+            if args.tolerance_offset is not None
+            else f"eliminate={args.eliminate}"
+        )
+        label = f"Parts average HD, parts={part_count}, {part_selection}"
+        if score == "match-rotation":
+            label = (
+                f"Rotation consistency match-parts={args.match_parts}, "
+                f"parts={part_count}, {part_selection}"
+            )
+        curve_specs.append({"label": label, "curve": curve})
     best_points = {
         spec["label"]: min(spec["curve"], key=lambda item: item["eer"])
         for spec in curve_specs
@@ -679,10 +689,10 @@ def main():
         "filters_source": filters_source,
         "filter_count": len(selected_filters),
         "score": args.score,
-        "parts": args.parts,
-        "eliminate": args.eliminate if args.tolerance_offset is None else None,
-        "tolerance_offset": args.tolerance_offset,
-        "match_parts": args.match_parts if args.score == "match-rotation" else None,
+        "parts": part_count if parts_requested else None,
+        "eliminate": args.eliminate if parts_requested and args.tolerance_offset is None else None,
+        "tolerance_offset": args.tolerance_offset if parts_requested else None,
+        "match_parts": args.match_parts if parts_requested and args.score == "match-rotation" else None,
     }
     plot_curve(curve_specs, args.axis, dataset_format, figure_path, metadata=plot_metadata)
 
